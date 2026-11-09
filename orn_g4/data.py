@@ -94,6 +94,9 @@ def mount_drive(mount_point: str = "/content/drive") -> None:
 def locate_dataset(
     source: str | Path = DEFAULT_DATASET_SOURCE,
     local_dir: str | Path = "/tmp/ornith-dataset",
+    *,
+    revision: str | None = None,
+    allow_drive_fallback: bool = False,
 ) -> Path:
     """Locate or download the dataset from local disk, Hugging Face Hub, or Drive.
 
@@ -129,18 +132,19 @@ def locate_dataset(
             snapshot_path = snapshot_download(
                 repo_id=clean_repo,
                 repo_type="dataset",
+                revision=revision,
                 local_dir=str(download_dir),
             )
             return Path(snapshot_path).resolve()
         except Exception as exc:
-            if not Path(DRIVE_DATASET_ZIP).is_file():
+            if not allow_drive_fallback or not Path(DRIVE_DATASET_ZIP).is_file():
                 raise DatasetError(
                     f"Failed to resolve dataset from Hugging Face ({clean_repo}): {exc}"
                 ) from exc
 
     # 3. Google Drive fallback
     drive_p = Path(DRIVE_DATASET_ZIP)
-    if drive_p.is_file():
+    if allow_drive_fallback and drive_p.is_file():
         return drive_p.resolve()
 
     raise DatasetError(
@@ -457,6 +461,8 @@ def build_layout(
     exclude_dirs: list[str] | None = None,
     *,
     zip_path: str | Path | None = None,
+    revision: str | None = None,
+    allow_drive_fallback: bool = False,
 ) -> DatasetLayout:
     """Run the dataset import pipeline: resolve, download/copy, extract, manifest.
 
@@ -471,7 +477,7 @@ def build_layout(
     if zip_path is not None:
         source = zip_path
 
-    resolved = locate_dataset(source, local_dir=local_dir)
+    resolved = locate_dataset(source, local_dir=local_dir, revision=revision, allow_drive_fallback=allow_drive_fallback)
 
     if resolved.is_file():
         if not verify_zip_integrity(resolved):
