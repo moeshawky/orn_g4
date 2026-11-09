@@ -36,6 +36,7 @@ DRIVE_DATASET_ZIP = "/content/drive/MyDrive/azrael-dataset.zip"
 #: Persistent run directory root on Google Drive (work-order §7 / §11).
 DRIVE_RUN_ROOT = "/content/drive/MyDrive/ornith-ternary-runs"
 
+#: LEGACY MVP ONLY: not an authoritative source for new HF releases.
 #: Frozen pre-tokenized SFT dataset release figures (work-order §1).
 EXPECTED_DATASET_RECORDS = 17_848
 EXPECTED_DATASET_SHARDS = 7
@@ -46,6 +47,7 @@ EXPECTED_MAX_SEQ_LEN = 8_192
 #: Expected EOS token ID in tokenizer contract
 EXPECTED_EOS_ID = 248046
 
+#: LEGACY template fingerprint. New runs must derive hash from the actual model artifact.
 #: Expected template hash prefix and revision
 EXPECTED_TEMPLATE_SHA256_PREFIX = "9dd2fbd2"
 EXPECTED_TEMPLATE_REVISION = "33e8951"
