@@ -166,3 +166,68 @@ def test_frozen_dataset_parquet_and_split_hygiene(tmp_path):
     with pytest.raises(DataAlignmentError, match="labels are not unshifted"):
         bad_ds.record(0)
 
+
+def test_locate_dataset_local_dir_and_file(tmp_path):
+    from orn_g4.data import locate_dataset, import_dataset
+
+    d = tmp_path / "my_dataset"
+    d.mkdir()
+    f = tmp_path / "archive.zip"
+    f.write_text("dummy")
+
+    assert locate_dataset(d) == d.resolve()
+    assert locate_dataset(str(f)) == f.resolve()
+    assert import_dataset(d) == d.resolve()
+
+
+def test_build_layout_from_directory_with_dict_manifest(tmp_path, monkeypatch):
+    from orn_g4.data import build_layout
+
+    dataset_root = tmp_path / "hf_snapshot"
+    train_ready = dataset_root / "train_ready" / "mvp"
+    train_ready.mkdir(parents=True)
+    shard_file = train_ready / "part_frozen.npz"
+    _make_shard_npz(shard_file)
+
+    manifest_data = {
+        "dataset": {
+            "total_records": 10,
+            "total_tokens": 80,
+            "supervised_tokens": 40,
+            "max_seq_len": 8,
+        },
+        "shards": [
+            {
+                "path": "train_ready/mvp/part_frozen.npz",
+                "rows": 10,
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            }
+        ],
+    }
+    (dataset_root / "DATASET_RELEASE_MANIFEST.json").write_text(json.dumps(manifest_data))
+
+    layout = build_layout(source=dataset_root)
+    assert layout.dataset_root == dataset_root
+    assert len(layout.shards) == 1
+    assert layout.shards[0].name == "part_frozen.npz"
+    assert layout.shards[0].num_examples == 10
+
+
+def test_locate_dataset_hf_snapshot(tmp_path, monkeypatch):
+    from orn_g4.data import locate_dataset
+
+    fake_hf_dir = tmp_path / "fake_hf_download"
+    fake_hf_dir.mkdir()
+
+    def fake_snapshot_download(repo_id, repo_type, local_dir):
+        assert repo_id == "moeshawky/azrael-dataset"
+        assert repo_type == "dataset"
+        return str(fake_hf_dir)
+
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    res = locate_dataset("hf://moeshawky/azrael-dataset")
+    assert res == fake_hf_dir
+
+

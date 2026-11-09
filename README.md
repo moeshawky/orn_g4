@@ -2,7 +2,7 @@
 
 > **Deterministic 1.58-bit ternary quantization, low-rank recovery, and canonical safetensors serialization for Ornith-1.5-9B and Qwen3.5 architectures.**
 
-[![Tests](https://img.shields.io/badge/tests-60%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-63%20passed-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue.svg)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)]()
 [![Framework](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)]()
@@ -80,7 +80,21 @@ model = load_foundation_model(model_dir, device="cuda", torch_dtype=torch.bfloat
 processor, tokenizer = load_processor_and_tokenizer(model_dir)
 ```
 
-### 2. Convert Linear Layers to Ternary
+### 2. Import Frozen Dataset
+
+```python
+from orn_g4.data import import_dataset, build_layout
+
+# Primary Hugging Face dataset repository (or local directory / Google Drive zip)
+dataset_source = "hf://moeshawky/azrael-dataset"
+
+# Downloads snapshot from Hugging Face and verifies release manifest
+layout = build_layout(source=dataset_source)
+print(f"Dataset root: {layout.dataset_root}")
+print(f"Resolved shards: {len(layout.shards)}")
+```
+
+### 3. Convert Linear Layers to Ternary
 
 ```python
 import torch
@@ -96,7 +110,7 @@ ternary_layer = TernaryLinear.from_linear(linear, codes, scales, rank=16)
 module_replace(model, "model.layers.0.self_attn.q_proj", ternary_layer)
 ```
 
-### 3. Save & Reload Canonical Checkpoints
+### 4. Save & Reload Canonical Checkpoints
 
 ```python
 from pathlib import Path
@@ -111,7 +125,7 @@ save_canonical(model, out_dir, source_id="ornith-1.5-9b")
 reloaded_model, manifest = load_canonical(out_dir, device="cuda")
 ```
 
-### 4. Two-Stage Decoupled Recovery
+### 5. Two-Stage Decoupled Recovery
 
 ```python
 from orn_g4.recovery import train_recovery

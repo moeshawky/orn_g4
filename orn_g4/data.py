@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_DATASET_SOURCE, DRIVE_DATASET_ZIP, HF_DATASET_HANDLE
 from .errors import DataAlignmentError, DatasetError
 from .utils import ensure_dir, sha256_file
 
@@ -43,11 +44,11 @@ class ShardRef:
 
 @dataclass(frozen=True)
 class DatasetLayout:
-    """Resolved dataset layout after extraction."""
+    """Resolved dataset layout after extraction or snapshot download."""
 
-    zip_path: Path  # local copy of the ZIP
-    extract_dir: Path  # where it was extracted
-    dataset_root: Path  # nested azrael-dataset/ directory
+    zip_path: Path | None  # local copy of the ZIP (or None if direct directory)
+    extract_dir: Path  # where it was extracted or downloaded
+    dataset_root: Path  # nested azrael-dataset/ directory or repository root
     manifest: dict  # parsed DATASET_RELEASE_MANIFEST.json
     train_ready_dir: Path | None
     shards: list[ShardRef]
@@ -88,6 +89,72 @@ def mount_drive(mount_point: str = "/content/drive") -> None:
             "Colab cell before importing the dataset."
         ) from exc
     drive.mount(mount_point)
+
+
+def locate_dataset(
+    source: str | Path = DEFAULT_DATASET_SOURCE,
+    local_dir: str | Path = "/tmp/ornith-dataset",
+) -> Path:
+    """Locate or download the dataset from local disk, Hugging Face Hub, or Drive.
+
+    Resolution cascade:
+    1. Direct local path (file or directory) if ``Path(source).exists()``.
+    2. Hugging Face Hub snapshot download if ``source`` is an ``hf://`` URI,
+       equals ``HF_DATASET_HANDLE``, or has an ``owner/repo`` format.
+    3. Google Drive fallback if ``DRIVE_DATASET_ZIP`` exists.
+
+    # Errors: raises :class:`DatasetError` when resolution fails across all tiers.
+    """
+    raw_str = str(source).strip()
+    if raw_str.startswith("hf://"):
+        clean_repo = raw_str[len("hf://"):].strip()
+        is_hf = True
+    else:
+        clean_repo = raw_str
+        is_hf = False
+
+    # 1. Local filesystem check
+    if not is_hf:
+        local_p = Path(raw_str).expanduser()
+        if local_p.exists():
+            return local_p.resolve()
+
+    # 2. Hugging Face Hub
+    if is_hf or clean_repo == HF_DATASET_HANDLE or ("/" in clean_repo and not clean_repo.startswith("/")):
+        try:
+            from huggingface_hub import snapshot_download
+
+            download_dir = Path(local_dir).expanduser().resolve()
+            download_dir.mkdir(parents=True, exist_ok=True)
+            snapshot_path = snapshot_download(
+                repo_id=clean_repo,
+                repo_type="dataset",
+                local_dir=str(download_dir),
+            )
+            return Path(snapshot_path).resolve()
+        except Exception as exc:
+            if not Path(DRIVE_DATASET_ZIP).is_file():
+                raise DatasetError(
+                    f"Failed to resolve dataset from Hugging Face ({clean_repo}): {exc}"
+                ) from exc
+
+    # 3. Google Drive fallback
+    drive_p = Path(DRIVE_DATASET_ZIP)
+    if drive_p.is_file():
+        return drive_p.resolve()
+
+    raise DatasetError(
+        f"Dataset not found for source {source!r}. Checked local filesystem, "
+        f"Hugging Face ({clean_repo}), and Google Drive ({DRIVE_DATASET_ZIP})."
+    )
+
+
+def import_dataset(
+    source: str | Path = DEFAULT_DATASET_SOURCE,
+    local_dir: str | Path = "/tmp/ornith-dataset",
+) -> Path:
+    """Top-level alias for :func:`locate_dataset`."""
+    return locate_dataset(source=source, local_dir=local_dir)
 
 
 def locate_zip(zip_path: str | Path = "/content/drive/MyDrive/azrael-dataset.zip") -> Path:
@@ -276,42 +343,68 @@ def resolve_shards(
     excluded = set(exclude_dirs or [])
     excluded.add("eval_firewall")
 
-    shard_names: list[str] = []
+    raw_items: list[str | dict] = []
     for key in ("shards", "train_shards", "files", "training_shards"):
         val = manifest.get(key)
         if isinstance(val, list):
-            shard_names = [str(v) for v in val]
+            raw_items = val
             break
         if isinstance(val, dict):
             # manifest may nest shards under a sub-table
             for sub in val.values():
                 if isinstance(sub, list):
-                    shard_names = [str(v) for v in sub]
+                    raw_items = sub
                     break
-            if shard_names:
+            if raw_items:
                 break
 
-    # Manifest may declare shard paths relative to train_ready/ or to root.
     train_ready = root / "train_ready"
     shards: list[ShardRef] = []
-    for name in shard_names:
-        candidate_paths = [root / name, train_ready / name]
+    for item in raw_items:
+        if isinstance(item, dict):
+            name = str(item.get("path") or item.get("file") or item.get("name") or "")
+            checksum = item.get("sha256") or item.get("checksum")
+            num_examples = item.get("rows") or item.get("num_examples")
+        else:
+            name = str(item)
+            checksum = (
+                manifest.get("checksums", {}).get(name)
+                if isinstance(manifest.get("checksums"), dict)
+                else None
+            )
+            num_examples = None
+
+        if not name:
+            continue
+
+        base_name = Path(name).name
+        candidate_paths = [
+            root / name,
+            train_ready / name,
+            root / base_name,
+            train_ready / base_name,
+            train_ready / "mvp" / base_name,
+            root / "train_ready" / "mvp" / base_name,
+        ]
         resolved = None
         for cp in candidate_paths:
             if cp.is_file():
                 resolved = cp
                 break
         if resolved is None:
-            # Directory-based shard: look inside train_ready for a dir named `name`.
-            d = train_ready / name
-            if d.is_dir():
-                # arrays inside the directory
-                files = sorted(d.iterdir())
-                resolved = d  # marker; arrays discovered below
+            # Directory-based shard: look inside candidate dirs
+            for cd in (train_ready / name, root / name, train_ready / base_name):
+                if cd.is_dir():
+                    resolved = cd
+                    break
         if resolved is None:
             raise DatasetError(
-                f"declared shard {name!r} not found at {root / name} or {train_ready / name}"
+                f"declared shard {name!r} not found under {root} or {train_ready}"
             )
+
+        # Skip shards residing in excluded directories (e.g. eval_firewall)
+        if any(part in excluded for part in resolved.parts):
+            continue
 
         if resolved.is_dir():
             files = sorted(resolved.iterdir())
@@ -320,31 +413,29 @@ def resolve_shards(
                 array_names.extend(_discover_arrays_in_shard(f))
             shards.append(
                 ShardRef(
-                    name=name,
+                    name=base_name,
                     path=resolved,
                     checksum=None,
                     arrays=array_names,
-                    num_examples=None,
+                    num_examples=num_examples,
                     checksum_ok=None,
                 )
             )
         else:
-            checksum = (
-                manifest.get("checksums", {}).get(name)
-                if isinstance(manifest.get("checksums"), dict)
-                else None
-            )
             array_names = _discover_arrays_in_shard(resolved)
             ok = None
             if checksum is not None:
-                ok = sha256_file(resolved) == checksum
+                actual_sha = sha256_file(resolved)
+                clean_ck = str(checksum).removeprefix("sha256:").lower()
+                clean_actual = actual_sha.removeprefix("sha256:").lower()
+                ok = clean_actual == clean_ck
             shards.append(
                 ShardRef(
-                    name=name,
+                    name=base_name,
                     path=resolved,
                     checksum=checksum,
                     arrays=array_names,
-                    num_examples=None,
+                    num_examples=num_examples,
                     checksum_ok=ok,
                 )
             )
@@ -360,25 +451,51 @@ def resolve_shards(
 
 
 def build_layout(
-    zip_path: str | Path = "/content/drive/MyDrive/azrael-dataset.zip",
+    source: str | Path = DEFAULT_DATASET_SOURCE,
     local_dir: str | Path = "/tmp/ornith-dataset",  # noqa: S108  (config default)
     extract_dir: str | Path = "/tmp/ornith-dataset-extract",  # noqa: S108  (config default)
     exclude_dirs: list[str] | None = None,
+    *,
+    zip_path: str | Path | None = None,
 ) -> DatasetLayout:
-    """Run the full import pipeline: verify, copy, extract, resolve, manifest.
+    """Run the dataset import pipeline: resolve, download/copy, extract, manifest.
 
-    Does NOT load tensors (that is ``load_shard``); it only resolves the
-    layout so the controller can decide shard ordering and budgeting.
+    Accepts either an explicit source (local directory, ZIP file, or Hugging Face
+    dataset handle) or a legacy ``zip_path`` kwarg. Does NOT load tensors into
+    memory (that is :func:`load_shard`); it resolves the layout so the controller
+    can order and budget shards.
 
     # Errors: raises :class:`DatasetError` at the first failed step, naming the
     step and the producer status.
     """
-    zpath = locate_zip(zip_path)
-    if not verify_zip_integrity(zpath):
-        raise DatasetError(f"ZIP integrity check failed for {zpath}")
-    local_copy = copy_zip_to_local(zpath, local_dir)
-    exdir = extract_zip(local_copy, extract_dir)
-    droot = resolve_dataset_root(exdir)
+    if zip_path is not None:
+        source = zip_path
+
+    resolved = locate_dataset(source, local_dir=local_dir)
+
+    if resolved.is_file():
+        if not verify_zip_integrity(resolved):
+            raise DatasetError(f"ZIP integrity check failed for {resolved}")
+        local_copy = copy_zip_to_local(resolved, local_dir)
+        exdir = extract_zip(local_copy, extract_dir)
+        droot = resolve_dataset_root(exdir)
+        zip_file_path: Path | None = local_copy
+    elif resolved.is_dir():
+        exdir = resolved
+        if (resolved / "DATASET_RELEASE_MANIFEST.json").is_file() or (resolved / "train_ready").is_dir():
+            droot = resolved
+        elif (resolved / "azrael-dataset" / "DATASET_RELEASE_MANIFEST.json").is_file():
+            droot = resolved / "azrael-dataset"
+        else:
+            try:
+                droot = resolve_dataset_root(resolved)
+            except DatasetError:
+                droot = resolved
+        zip_cand = droot / "azrael-dataset.zip"
+        zip_file_path = zip_cand if zip_cand.is_file() else None
+    else:
+        raise DatasetError(f"Resolved dataset path {resolved} is neither a file nor a directory")
+
     manifest = load_manifest(droot)
     shards = resolve_shards(droot, manifest, exclude_dirs=exclude_dirs)
 
@@ -387,7 +504,7 @@ def build_layout(
     excluded_names = sorted(set(exclude_dirs or []) | {"eval_firewall"})
 
     return DatasetLayout(
-        zip_path=local_copy,
+        zip_path=zip_file_path,
         extract_dir=exdir,
         dataset_root=droot,
         manifest=manifest,
@@ -663,6 +780,8 @@ __all__ = [
     "TensorBundle",
     "FrozenDataset",
     "mount_drive",
+    "locate_dataset",
+    "import_dataset",
     "locate_zip",
     "verify_zip_integrity",
     "copy_zip_to_local",

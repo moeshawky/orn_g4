@@ -24,6 +24,12 @@ KAGGLE_MODEL_HANDLE = "mohamedshawky4340/ornith-1.5-9b/transformers/bf16/1"
 #: Native template repository (authoritative cross-check, work-order §2).
 TEMPLATE_REPO = "https://huggingface.co/moeshawky/Azrael-9b-chat-template"
 
+#: Canonical Hugging Face dataset repository ID.
+HF_DATASET_HANDLE = "moeshawky/azrael-dataset"
+
+#: Primary default dataset source (defaults to Hugging Face).
+DEFAULT_DATASET_SOURCE = HF_DATASET_HANDLE
+
 #: Google Drive root path for the dataset ZIP (work-order §3).
 DRIVE_DATASET_ZIP = "/content/drive/MyDrive/azrael-dataset.zip"
 
@@ -242,6 +248,7 @@ class RunConfig:
     run_id: str
     model_handle: str = DEFAULT_MODEL_HANDLE
     template_repo: str = TEMPLATE_REPO
+    dataset_source: str = DEFAULT_DATASET_SOURCE
     dataset_zip: str = DRIVE_DATASET_ZIP
     run_dir: str = ""
     local_work_dir: str = "/tmp/ornith-run"  # noqa: S108  (config default, not created here)
@@ -279,6 +286,7 @@ class Settings:
     RUN_ID: str = "ornith-g4-v1"
     MODEL_HANDLE: str = DEFAULT_MODEL_HANDLE
     MODEL_OVERRIDE: str = ""
+    DATASET_SOURCE: str = DEFAULT_DATASET_SOURCE
     DATASET_ZIP: str = DRIVE_DATASET_ZIP
     DATASET_DIR: str = ""
     RUN_ROOT: str = DRIVE_RUN_ROOT
@@ -519,6 +527,8 @@ __all__ = [
     "HF_MODEL_HANDLE",
     "DEFAULT_MODEL_HANDLE",
     "KAGGLE_MODEL_HANDLE",
+    "HF_DATASET_HANDLE",
+    "DEFAULT_DATASET_SOURCE",
     "TEMPLATE_REPO",
     "DRIVE_DATASET_ZIP",
     "DRIVE_RUN_ROOT",
