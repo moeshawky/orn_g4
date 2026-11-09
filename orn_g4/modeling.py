@@ -50,6 +50,7 @@ class ArchitectureReport:
 def import_model(
     handle: str = DEFAULT_MODEL_HANDLE,
     local_dir: str | Path | None = None,
+    revision: str | None = None,
 ) -> Path:
     """Download or resolve the foundation model from Hugging Face, Kaggle, or local path.
 
@@ -70,12 +71,15 @@ def import_model(
     clean_handle = handle.removeprefix("hf://").strip()
     is_kaggle = clean_handle.startswith("kaggle://") or clean_handle.count("/") > 1
 
+    if is_kaggle and revision is not None:
+        raise ModelSourceError("revision pinning applies to Hugging Face; use a versioned Kaggle handle")
     if not is_kaggle:
         try:
             from huggingface_hub import snapshot_download
 
             downloaded = snapshot_download(
                 repo_id=clean_handle,
+                revision=revision,
                 local_dir=str(local_dir) if local_dir else None,
                 repo_type="model",
             )
@@ -291,6 +295,7 @@ def load_foundation_model(
     device: str = "cuda:0",
     dtype: object = None,
     low_cpu_mem_usage: bool = True,
+    torch_dtype: object = None,
 ) -> object:
     """Load native foundation model (supporting Qwen3.5 multimodal architecture)."""
     import torch
@@ -298,7 +303,9 @@ def load_foundation_model(
 
     model_dir = Path(model_dir)
     cfg = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=False)
-    target_dtype = dtype or torch.bfloat16
+    if dtype is not None and torch_dtype is not None and dtype != torch_dtype:
+        raise ValueError("conflicting dtype and torch_dtype arguments")
+    target_dtype = dtype if dtype is not None else (torch_dtype if torch_dtype is not None else torch.bfloat16)
     kwargs: dict = {
         "torch_dtype": target_dtype,
         "trust_remote_code": False,
