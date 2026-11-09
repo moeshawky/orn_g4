@@ -163,3 +163,22 @@ def verify_frozen_template(dataset_root: str | Path, model_template_sha256: str)
         if declared is None or declared != digest:
             raise DatasetError(f"frozen template checksum mismatch in {sidecar}")
     return digest
+
+
+def inspect_frozen_mvp(layout: DatasetLayout, *, expected_max_seq_len: int = 8192) -> dict[str, int]:
+    """Summarize the seven-shard training subset, never archive-wide persona totals."""
+    if not layout.shards:
+        raise DatasetError("empty frozen MVP training subset")
+    if any(s.checksum_ok is not True for s in layout.shards):
+        raise DatasetError("frozen MVP has an unverified shard")
+    records = sum(int(s.num_examples) for s in layout.shards)
+    if records < 1:
+        raise DatasetError("frozen MVP contains no training records")
+    # Archive-wide release counts may include separate persona data; do not
+    # compare them with the deliberately narrower train_ready/mvp subset.
+    return {
+        "shard_count": len(layout.shards),
+        "verified_shards": sum(s.checksum_ok is True for s in layout.shards),
+        "train_records": records,
+        "max_seq_len_limit": expected_max_seq_len,
+    }
