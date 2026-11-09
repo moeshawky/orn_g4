@@ -79,7 +79,7 @@ def _lookup_sha(file: Path, root: Path, hashes: dict[str, set[str]]) -> str:
     rel = file.relative_to(root).as_posix()
     candidates = set(hashes.get(rel, set()))
     for path, values in hashes.items():
-        if path == file.name or path.endswith("/" + rel):
+        if Path(path).name == file.name or path.endswith("/" + rel):
             candidates.update(values)
     if not candidates:
         raise DatasetError(f"missing frozen shard checksum in existing manifests: {rel}")
