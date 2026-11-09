@@ -129,12 +129,10 @@ def locate_dataset(
 
             download_dir = Path(local_dir).expanduser().resolve()
             download_dir.mkdir(parents=True, exist_ok=True)
-            snapshot_path = snapshot_download(
-                repo_id=clean_repo,
-                repo_type="dataset",
-                revision=revision,
-                local_dir=str(download_dir),
-            )
+            download_kwargs = {"repo_id": clean_repo, "repo_type": "dataset", "local_dir": str(download_dir)}
+            if revision is not None:
+                download_kwargs["revision"] = revision
+            snapshot_path = snapshot_download(**download_kwargs)
             return Path(snapshot_path).resolve()
         except Exception as exc:
             if not allow_drive_fallback or not Path(DRIVE_DATASET_ZIP).is_file():
