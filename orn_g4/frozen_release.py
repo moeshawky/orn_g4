@@ -172,8 +172,10 @@ def inspect_frozen_mvp(layout: DatasetLayout, *, expected_max_seq_len: int = 819
     if any(s.checksum_ok is not True for s in layout.shards):
         raise DatasetError("frozen MVP has an unverified shard")
     records = sum(int(s.num_examples) for s in layout.shards)
-    if records < 1:
-        raise DatasetError("frozen MVP contains no training records")
+    if len(layout.shards) != 7:
+        raise DatasetError(f"frozen MVP expected exactly 7 shards, got {len(layout.shards)}")
+    if records != 17848:
+        raise DatasetError(f"frozen MVP expected 17,848 records, got {records}")
     # Archive-wide release counts may include separate persona data; do not
     # compare them with the deliberately narrower train_ready/mvp subset.
     return {
