@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import KAGGLE_MODEL_HANDLE
+from .config import DEFAULT_MODEL_HANDLE, HF_MODEL_HANDLE, KAGGLE_MODEL_HANDLE
 from .errors import ModelSourceError
 from .utils import class_name
 
@@ -48,39 +48,58 @@ class ArchitectureReport:
 
 
 def import_model(
-    handle: str = KAGGLE_MODEL_HANDLE,
+    handle: str = DEFAULT_MODEL_HANDLE,
+    local_dir: str | Path | None = None,
 ) -> Path:
-    """Download the exact Kaggle artifact via KaggleHub and return MODEL_DIR.
+    """Download or resolve the foundation model from Hugging Face, Kaggle, or local path.
 
-    Implements the work-order §1 snippet verbatim:
-
-        import kagglehub
-        MODEL_DIR = Path(
-            kagglehub.model_download(
-                "mohamedshawky4340/ornith-1.5-9b/transformers/bf16/1"
-            )
-        ).resolve()
-        assert (MODEL_DIR / "config.json").exists()
-
-    ``MODEL_DIR`` is used for all subsequent checkpoint loading; the original
-    ``/kaggle/input/...`` path is never treated as an accessible Colab path.
-
-    # Errors: raises :class:`ModelSourceError` when kagglehub is not installed,
-    the download fails, or ``config.json`` is absent from the result.
+    Resolution strategy:
+    1. Local filesystem: If `handle` is an existing path or directory containing `config.json`,
+       returns `Path(handle).resolve()`.
+    2. Hugging Face Hub: If `handle` is a standard Hugging Face repo ID (e.g. 'moeshawky/Ornith-1.5-9B'
+       or prefixed with 'hf://'), downloads via `huggingface_hub.snapshot_download`.
+    3. KaggleHub: If `handle` is a Kaggle artifact handle (e.g. contains '/transformers/' or starts
+       with 'kaggle://'), downloads via `kagglehub.model_download`.
     """
+    local_candidate = Path(handle)
+    if local_candidate.exists():
+        p = local_candidate.resolve()
+        if (p / "config.json").is_file():
+            return p
+
+    clean_handle = handle.removeprefix("hf://").strip()
+    is_kaggle = clean_handle.startswith("kaggle://") or clean_handle.count("/") > 1
+
+    if not is_kaggle:
+        try:
+            from huggingface_hub import snapshot_download
+
+            downloaded = snapshot_download(
+                repo_id=clean_handle,
+                local_dir=str(local_dir) if local_dir else None,
+                repo_type="model",
+            )
+            p = Path(downloaded).resolve()
+            if (p / "config.json").is_file():
+                return p
+        except Exception as exc:
+            raise ModelSourceError(
+                f"Hugging Face snapshot_download({clean_handle!r}) failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
     try:
-        import kagglehub  # lazy import
+        import kagglehub
     except ImportError as exc:
         raise ModelSourceError(
-            "kagglehub is not installed; run `%pip install -q kagglehub` in the "
-            "notebook (cell 01) before importing the model."
+            f"kagglehub is not installed and Hugging Face resolution failed for {handle!r}."
         ) from exc
 
+    kaggle_handle = clean_handle.removeprefix("kaggle://")
     try:
-        downloaded = kagglehub.model_download(handle)
-    except Exception as exc:  # network/auth/kaggle errors -> ModelSourceError
+        downloaded = kagglehub.model_download(kaggle_handle)
+    except Exception as exc:
         raise ModelSourceError(
-            f"kagglehub.model_download({handle!r}) failed: {type(exc).__name__}: {exc}"
+            f"kagglehub.model_download({kaggle_handle!r}) failed: {type(exc).__name__}: {exc}"
         ) from exc
 
     model_dir = Path(downloaded).resolve()
@@ -314,6 +333,8 @@ def load_processor_and_tokenizer(model_dir: Path | str) -> tuple[object, object]
 
 
 __all__ = [
+    "DEFAULT_MODEL_HANDLE",
+    "HF_MODEL_HANDLE",
     "KAGGLE_MODEL_HANDLE",
     "import_model",
     "load_config",

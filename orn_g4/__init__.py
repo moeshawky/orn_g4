@@ -46,6 +46,8 @@ from .config import (
     EXPECTED_MAX_SEQ_LEN,
     EXPECTED_SUPERVISED_TOKENS,
     EXPECTED_TOTAL_TOKENS,
+    DEFAULT_MODEL_HANDLE,
+    HF_MODEL_HANDLE,
     KAGGLE_MODEL_HANDLE,
     TEMPLATE_REPO,
     ExecutionManifest,
@@ -80,6 +82,8 @@ __version__ = "2.0.0"
 
 __all__ = [
     # config
+    "DEFAULT_MODEL_HANDLE",
+    "HF_MODEL_HANDLE",
     "KAGGLE_MODEL_HANDLE",
     "TEMPLATE_REPO",
     "DRIVE_DATASET_ZIP",

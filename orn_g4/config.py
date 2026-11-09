@@ -12,7 +12,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-#: Kaggle model handle, exact version, as mandated by work-order §1.
+#: Canonical Hugging Face model repository ID.
+HF_MODEL_HANDLE = "moeshawky/Ornith-1.5-9B"
+
+#: Primary default model handle (defaults to Hugging Face).
+DEFAULT_MODEL_HANDLE = HF_MODEL_HANDLE
+
+#: Kaggle model handle, exact version (maintained for backward compatibility).
 KAGGLE_MODEL_HANDLE = "mohamedshawky4340/ornith-1.5-9b/transformers/bf16/1"
 
 #: Native template repository (authoritative cross-check, work-order §2).
@@ -234,7 +240,7 @@ class RunConfig:
     """
 
     run_id: str
-    model_handle: str = KAGGLE_MODEL_HANDLE
+    model_handle: str = DEFAULT_MODEL_HANDLE
     template_repo: str = TEMPLATE_REPO
     dataset_zip: str = DRIVE_DATASET_ZIP
     run_dir: str = ""
@@ -271,7 +277,7 @@ class Settings:
 
     MODE: str = "SMOKE"  # 'STATIC' / 'SMOKE' / 'FULL'
     RUN_ID: str = "ornith-g4-v1"
-    MODEL_HANDLE: str = KAGGLE_MODEL_HANDLE
+    MODEL_HANDLE: str = DEFAULT_MODEL_HANDLE
     MODEL_OVERRIDE: str = ""
     DATASET_ZIP: str = DRIVE_DATASET_ZIP
     DATASET_DIR: str = ""
@@ -510,6 +516,8 @@ class TernaryArtifact:
 
 
 __all__ = [
+    "HF_MODEL_HANDLE",
+    "DEFAULT_MODEL_HANDLE",
     "KAGGLE_MODEL_HANDLE",
     "TEMPLATE_REPO",
     "DRIVE_DATASET_ZIP",

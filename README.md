@@ -69,11 +69,13 @@ pip install -e .
 
 ```python
 import torch
-from orn_g4.modeling import load_foundation_model, load_processor_and_tokenizer
+from orn_g4.modeling import import_model, load_foundation_model, load_processor_and_tokenizer
 
-model_dir = "mohamedshawky4340/ornith-1.5-9b/transformers/bf16/1"
+# Primary Hugging Face model repository (or Kaggle handle / local path)
+model_handle = "moeshawky/Ornith-1.5-9B"
 
-# Automatically handles multimodal vs causal architecture mappings
+# Automatically downloads from Hugging Face without requiring Kaggle API tokens
+model_dir = import_model(model_handle)
 model = load_foundation_model(model_dir, device="cuda", torch_dtype=torch.bfloat16)
 processor, tokenizer = load_processor_and_tokenizer(model_dir)
 ```
