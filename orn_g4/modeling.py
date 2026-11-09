@@ -77,12 +77,14 @@ def import_model(
         try:
             from huggingface_hub import snapshot_download
 
-            downloaded = snapshot_download(
-                repo_id=clean_handle,
-                revision=revision,
-                local_dir=str(local_dir) if local_dir else None,
-                repo_type="model",
-            )
+            download_kwargs = {
+                "repo_id": clean_handle,
+                "local_dir": str(local_dir) if local_dir else None,
+                "repo_type": "model",
+            }
+            if revision is not None:
+                download_kwargs["revision"] = revision
+            downloaded = snapshot_download(**download_kwargs)
             p = Path(downloaded).resolve()
             if (p / "config.json").is_file():
                 return p
