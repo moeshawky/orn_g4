@@ -2,11 +2,11 @@
 
 > **Deterministic 1.58-bit ternary quantization, low-rank recovery, and canonical safetensors serialization for Ornith-1.5-9B and Qwen3.5 architectures.**
 
-[![Tests](https://img.shields.io/badge/tests-63%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-75%20passed-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue.svg)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)]()
 [![Framework](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)]()
-[![HuggingFace](https://img.shields.io/badge/Transformers-4.45%2B-yellow.svg)]()
+[![HuggingFace](https://img.shields.io/badge/Transformers-5.8.1%2B-yellow.svg)]()
 
 `orn_g4` is a high-precision quantization, recovery, and deployment engine designed for compressing 9.65-billion-parameter hybrid models (transformer blocks, Gated DeltaNet recurrent states, vision towers, and multimodal projection layers) into ternary representation ($\{-1, 0, +1\}$ discrete codes with FP32 group scales) while maintaining behavioral parity and numerical stability under tight VRAM constraints (15–24 GiB).
 
@@ -21,6 +21,7 @@
 - **Selective STE QAT**: Parameter-bounded Straight-Through Estimator fine-tuning with FP32 shadows and audited discrete code flips.
 - **Canonical Safetensors Serialization**: 512MB chunked safetensors export with Hugging Face specification compliance (`__metadata__` wire format) and automatic non-persistent RoPE buffer (`inv_freq`) reconstruction upon reloading.
 - **Parquet Dataset Hygiene**: Preflight-verified Parquet shard loading with bitwise duplicate-closure clustering, right-padding assertions, and unshifted position-aligned label validation.
+- **Fail-Closed Source Provenance**: Model and dataset inputs pinned to immutable Hugging Face commit SHAs, with the frozen seven-shard MVP training subset verified read-only against the SHA-256 proofs that ship with the release — no dataset file is created, modified, or regenerated.
 
 ---
 
@@ -85,10 +86,12 @@ processor, tokenizer = load_processor_and_tokenizer(model_dir)
 ```python
 from orn_g4.data import import_dataset, build_layout
 
-# Primary Hugging Face dataset repository (or local directory / Google Drive zip)
+# Primary Hugging Face dataset repository (or a local directory)
 dataset_source = "hf://moeshawky/azrael-dataset"
 
-# Downloads snapshot from Hugging Face and verifies release manifest
+# Downloads snapshot from Hugging Face and verifies release manifest.
+# The Google Drive tier is opt-in: pass allow_drive_fallback=True to enable it.
+# Pin an immutable commit with revision="<sha>" when the run must be reproducible.
 layout = build_layout(source=dataset_source)
 print(f"Dataset root: {layout.dataset_root}")
 print(f"Resolved shards: {len(layout.shards)}")
@@ -160,19 +163,25 @@ train_recovery(
 ```
 orn_g4/
 ├── __init__.py                  # Public exports & versioning
-├── config.py                    # Settings, mode controls (STATIC/SMOKE/FULL), thresholds
+├── checkpoint_spec.py           # Canonical on-disk ternary format & standalone completeness
+├── config.py                    # RunConfig, directory layout, source handles, release figures
+├── controller.py                # 11-stage deterministic resumable controller
 ├── data.py                      # FrozenDataset, Parquet streaming, bitwise duplicate closure
 ├── env.py                       # Hardware inspection (GPU, VRAM, BF16, CUDA compute)
 ├── errors.py                    # Explicit domain exceptions (Alignment, Gate, Recovery)
+├── evaluation.py                # Offline operational evaluation
 ├── export.py                    # Artifact packaging, dense BF16 materialization
+├── frozen_release.py            # Read-only frozen MVP shard & checksum verification
 ├── gates.py                     # Execution gates & verification assertions
 ├── loader.py                    # Canonical checkpoint persistence & RoPE restoration
 ├── lora.py                      # PEFT LoRA wiring, input require grads, target filtering
 ├── modeling.py                  # KaggleHub import & multimodal architecture discovery
 ├── pre_conversion_surgery_probe.py # Bounded activation collection & P1/P2/P4 surgical probes
 ├── recovery.py                  # Two-stage recovery, scale clamping, and selective QAT
+├── reporting.py                 # Experiment report generation
 ├── rotation.py                  # Signed Hadamard rotation transforms
 ├── safetensors_io.py            # Spec-compliant sharded safetensors reader/writer
+├── source_contract.py           # Fail-closed Hub source pinning & release validation
 ├── template.py                  # Native chat-template inspection & SHA256 verification
 ├── ternary_core.py              # GroupedTernary, TernaryLinear, pack/unpack kernels
 ├── ternary_gptq.py              # Second-order group-local GPTQ error feedback
@@ -193,7 +202,7 @@ pytest tests/ -v
 ```
 
 ```
-============================== 60 passed in 3.35s ==============================
+============================== 75 passed in 5.67s ==============================
 ```
 
 ---

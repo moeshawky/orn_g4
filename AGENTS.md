@@ -15,7 +15,7 @@ VIOLATE ANY → the failure surfaces later, in someone else's session, as a sile
 
 ## What this is
 
-23 modules under `orn_g4/` (~9.8k LOC) + `tests/`. A library only — no CLI, no `__main__`, no notebooks: 22 lines in the package reference `cell_00..cell_13`, but 0 files named `cell_*` are tracked here (they live in the Azrael-g4 Colab project). Docstrings cite an external "work-order §N" spec that is not in this repo — the code is the only source of truth for what was built. Every claim below was probed at commit `3af2962`.
+25 modules under `orn_g4/` (~10.2k LOC) + `tests/`. A library only — no CLI, no `__main__`, no notebooks: 22 lines in the package reference `cell_00..cell_13`, but 0 files named `cell_*` are tracked here (they live in the Azrael-g4 Colab project). Docstrings cite an external "work-order §N" spec that is not in this repo — the code is the only source of truth for what was built. Every claim below was probed at commit `61ab3ac` (the code state; the doc refresh that follows it changes no code).
 
 ## Ramp-up read order
 
@@ -30,14 +30,14 @@ Cheapest first; stop as soon as you have what you need.
 ## Commands
 
 ```bash
-python -m pytest tests/ -q                          # 63 passed at 3af2962, ~5s warm, CPU-only, no network
+python -m pytest tests/ -q                          # 75 passed at 61ab3ac, ~6s warm, CPU-only, no network
 python -m pytest tests/test_data.py -q              # one module
 python -m pytest tests/test_data.py::test_name -q   # one test
 ```
 
 - Not pip-installed in a clean checkout: `tests/conftest.py` puts the repo root on `sys.path`, so pytest works from any cwd.
 - No lint / typecheck / formatter config exists (no `[tool.ruff]`, `[tool.mypy]`, `[tool.pytest.ini_options]`). pytest is the whole gate.
-- Test deps: numpy + torch; pyarrow only for `FrozenDataset`. No GPU, no HF network — HF/Drive paths are mocked with synthetic fixtures built in `tmp_path`.
+- Test deps: numpy + torch; pyarrow for `FrozenDataset` and for the frozen-release preflight (`frozen_release.build_frozen_mvp_layout` reads Parquet metadata). No GPU, no HF network — HF/Drive paths are mocked with synthetic fixtures built in `tmp_path`.
 
 ## Import resolution
 
@@ -55,7 +55,7 @@ python -m pytest tests/test_data.py::test_name -q   # one test
 
 ## Name corrections
 
-Every dangling `:func:` cross-reference in this repo lives in `orn_g4/errors.py` — 8 references across 6 modules (of 19 `:func:` references repo-wide). Resolve against the module namespace, never the docstring:
+Every dangling `:func:` cross-reference in this repo lives in `orn_g4/errors.py` — 8 references across 6 modules (of 23 `:func:` references in `orn_g4/errors.py`, 33 repo-wide). Resolve against the module namespace, never the docstring:
 
 | Cited in `orn_g4/errors.py` | Actually |
 |---|---|
@@ -83,6 +83,8 @@ Non-obvious ownership only; the rest is self-describing.
 | `orn_g4/loader.py` | `save_canonical`/`load_canonical`, `module_replace`, trainable checkpoints, RoPE buffer restore |
 | `orn_g4/ternary_core.py` | the math, numpy-first so it is unit-testable CPU-only |
 | `orn_g4/recovery.py` | scale distillation, low-rank residual, selective QAT |
+| `orn_g4/frozen_release.py` | read-only verification of the seven frozen MVP shards against the SHA-256 sidecars that ship with the release; **no in-package caller** — the notebook drives it |
+| `orn_g4/source_contract.py` | fail-closed Hub source pinning (`resolve_hub_sha`, `enforce_source_lock`), manifest-driven release validation, chat-template alignment; **no in-package caller** — the notebook drives it |
 | `orn_g4/gates.py`, `orn_g4/evaluation.py`, `orn_g4/reporting.py` | verification gates A–F; offline eval; report labelled `UNVERIFIED-IN-THIS-ENVIRONMENT` |
 
 `orn_g4/safetensors_io.py` implements the HF wire format; `orn_g4/utils.py` holds atomic writes and streaming sha256; `orn_g4/env.py`, `orn_g4/template.py`, `orn_g4/errors.py` are the env inspector, chat-template fingerprint, and error vocabulary.
@@ -94,11 +96,11 @@ Non-obvious ownership only; the rest is self-describing.
 3. **Version drift:** `pyproject.toml` = `0.1.0`, `orn_g4.__version__` = `2.0.0`, `RunConfig.schema_version` = `2.0.0` (the last is what lands in manifests).
 4. **`config.Settings` is dead code** — nothing imports it. Its `MODE` (STATIC/SMOKE/FULL) knob is not wired to anything, and `orn_g4/__init__.py`'s claim of an `ORN_G4_GATE` env var is stale: the only env var read anywhere is `PRISM_HOME` (`orn_g4/gates.py`).
 5. **`TernaryLinear` is `None` without torch** (`orn_g4/ternary_core.py` sets it to `None` in a module-level `except ImportError`), so `TernaryLinear.from_linear(...)` fails with `AttributeError`, not `ImportError`. `loader.save_canonical` guards with `if TernaryLinear is not None` for exactly this reason.
-6. **`README.md`'s "Package Structure" is stale** — it omits `orn_g4/checkpoint_spec.py`, `orn_g4/controller.py`, `orn_g4/evaluation.py`, `orn_g4/reporting.py`, and claims "60 passed" (63 at `3af2962`).
+6. **Two frozen-release contracts, deliberately in tension.** `frozen_release.inspect_frozen_mvp` hard-asserts the legacy MVP figures (exactly 7 shards, exactly 17,848 records), while `source_contract.validate_release` treats those counts as *non*-authoritative and validates against the release manifest instead. `orn_g4/config.py` now labels `EXPECTED_DATASET_RECORDS` / `EXPECTED_DATASET_SHARDS` / `EXPECTED_TEMPLATE_SHA256_PREFIX` / `EXPECTED_TEMPLATE_REVISION` as `LEGACY MVP ONLY`. Pick the contract that matches the release you are running; do not "reconcile" them by loosening the MVP assertions.
 7. **R-26 rule** (`export._assert_not_source_fp`): a checkpoint whose tensors are all floating-point (no int8 codes) under a ternary filename raises `ExportError`.
-8. **Undeclared runtime deps.** `huggingface_hub`, `kagglehub`, `peft` are imported by the code but absent from `pyproject.toml` dependencies — `pip install -e .` will not bring them in. `peft` is only needed by `lora.setup_peft_lora`.
-9. **`transformers` may not import.** Probe `python -c "import transformers"` before relying on `modeling.discover_architecture`, `load_foundation_model`, `load_processor_and_tokenizer`, or `orn_g4/template.py`. At `3af2962` it fails: `huggingface-hub>=1.5.0,<2.0` required, found `2.4.0`. numpy/torch paths are unaffected.
-10. **Unmerged branch.** `origin/fix/g4-source-run-contract-20261109` is not on `main` and adds two modules absent from the working tree — do not import them.
+8. **Undeclared runtime deps.** `kagglehub` and `peft` are imported by the code but absent from `pyproject.toml` dependencies — `pip install -e .` will not bring them in. `peft` is only needed by `lora.setup_peft_lora`. (`huggingface_hub` *is* declared, as `>=0.28.0`.)
+9. **`transformers` may not import.** Probe `python -c "import transformers"` before relying on `modeling.discover_architecture`, `load_foundation_model`, `load_processor_and_tokenizer`, or `orn_g4/template.py`. At `61ab3ac` it still fails: `huggingface-hub>=1.5.0,<2.0` required, found `2.4.0`. numpy/torch paths are unaffected. The declared floor is `transformers>=5.8.1` and the installed version is `5.16.1`, so the floor is satisfied — the break is the *upper* bound on `huggingface_hub`, and because `pyproject.toml` declares `huggingface_hub>=0.28.0` with no ceiling, `pip install -e .` will **not** repair it. Fixing it means pinning `huggingface_hub<2.0` in the environment, not editing the floor.
+10. **The two preflight modules are notebook-facing, not wired in.** `frozen_release` and `source_contract` have no caller anywhere inside `orn_g4/` — only their own tests import them. They are consumed by the Azrael-g4 notebook (PR #1), which is not tracked in this repo, so "the notebook calls it" is an inference from the PR description and not a fact you can verify here. The same is true of the new `revision` / `allow_drive_fallback` arguments: `controller.py` never calls `build_layout`, `locate_dataset`, `import_model`, or `load_foundation_model`.
 
 ## Data contract (`orn_g4/data.py`)
 
@@ -106,12 +108,12 @@ Non-obvious ownership only; the rest is self-describing.
 - Per row it enforces: `len(mask) == len(labels) == len(ids)`; declared `token_count`/`supervised_count` match the arrays; `1 <= n <= 8192`; mask ∈ {0,1}; **right-padding only** (any other pattern → `DataAlignmentError: non-right padding requires dedicated collator`); padded positions must not be supervised; labels must be **unshifted** and position-aligned with `input_ids` at supervised positions; token ids inside the tokenizer vocab (only checked when a tokenizer is passed to the constructor).
 - `eval_firewall/` is **always** excluded from training and calibration (`resolve_shards` hardcodes it).
 - `resolve_shards` reads the shard list from the manifest under `shards` / `train_shards` / `files` / `training_shards` (list or dict-of-lists) and raises `DatasetError` if a declared shard is missing. It never silently guesses the layout.
-- Frozen release figures (`orn_g4/config.py`): 7 shards, 17,848 records, 30,029,360 total tokens, 8,748,755 supervised tokens, max_seq_len 8192, EOS id 248046, template sha256 prefix `9dd2fbd2`, revision `33e8951`.
+- Frozen release figures (`orn_g4/config.py`, marked `LEGACY MVP ONLY` — the frozen *MVP subset* figures, not archive-wide totals): 7 shards, 17,848 records, 30,029,360 total tokens, 8,748,755 supervised tokens, max_seq_len 8192, EOS id 248046, template sha256 prefix `9dd2fbd2`, revision `33e8951`. The release manifest declares 17,999 archive-wide records — 151 more than the MVP subset, held in a separate persona shard. Never compare archive-wide totals against the narrower `train_ready/mvp/` subset.
 
 ## Source resolution
 
 - `modeling.import_model(handle)`: local dir containing the model's own `config.json` → HF snapshot (`hf://owner/repo` or `owner/repo`) → KaggleHub (`kaggle://…` or any handle with more than one `/`) → else `ModelSourceError`.
-- `data.locate_dataset(source)`: local path → HF dataset snapshot (`hf://`, the exact `HF_DATASET_HANDLE`, or *any* string containing `/`) → Drive ZIP. The `owner/repo` heuristic means a non-existent relative path containing `/` is treated as an HF repo id.
+- `data.locate_dataset(source)`: local path → HF dataset snapshot (`hf://`, the exact `HF_DATASET_HANDLE`, or *any* string containing `/`) → Drive ZIP **only when `allow_drive_fallback=True`** (default `False` — the Drive tier is opt-in and the resolver fails closed by default). The `owner/repo` heuristic means a non-existent relative path containing `/` is treated as an HF repo id. `revision=None` pins the Hub snapshot to an immutable commit when set.
 - Handles live in `orn_g4/config.py`, the single source of truth: `HF_MODEL_HANDLE = moeshawky/Ornith-1.5-9B`, `HF_DATASET_HANDLE = moeshawky/azrael-dataset`, `KAGGLE_MODEL_HANDLE`, `TEMPLATE_REPO`, `DRIVE_DATASET_ZIP`, `DRIVE_RUN_ROOT`.
 
 ## Recovery invariants (`orn_g4/recovery.py`)
@@ -123,19 +125,19 @@ Non-obvious ownership only; the rest is self-describing.
 
 ## Conventions to preserve
 
-- Public API docstrings carry an explicit `# Errors:` note naming the exception type and the operator remediation (54 such notes in the package). This is the repo's contract style — keep it.
-- All exceptions derive from `OrnG4Error`; do not leak raw third-party exceptions across module boundaries.
+- Public API docstrings carry an explicit `# Errors:` note naming the exception type and the operator remediation (63 such notes in the package). This is the repo's contract style — keep it.
+- All exceptions derive from `OrnG4Error`; do not leak raw third-party exceptions across module boundaries. Every error *class* is defined in `orn_g4/errors.py` — feature modules import it from there. A feature module that defines its own exception type breaks the single catch-all: `except OrnG4Error` will not catch it.
 - Writes go through `utils.write_json_atomic` / `utils.atomic_write_bytes` (temp file + rename); checksums via `utils.sha256_file`.
 - `orn_g4/ternary_core.py` is numpy-first so the math stays unit-testable without torch; `orn_g4/ternary_ste.py` is the one deliberate exception with a top-level `import torch`.
 
 ## BANNED
 
 - Adding a top-level `import torch` / `import transformers` to a module — the package must import on a CPU-only host.
-- Trusting a symbol because a docstring names it — 8 of the 19 `:func:` references in `orn_g4/errors.py` do not exist.
+- Trusting a symbol because a docstring names it — 8 of the 23 `:func:` references in `orn_g4/errors.py` do not exist.
 - Writing into a saved checkpoint or artifact directory — `save_canonical` refuses an existing dir, and the controller re-runs a stage whose checksum moved.
 - Importing `orn_g4.config.Settings` or switching on `MODE` — dead code; nothing reads it.
 - Treating `pyproject.toml`'s `0.1.0` as the package version — `orn_g4.__version__` is `2.0.0`.
-- Assuming `pip install -e .` supplies `huggingface_hub`, `kagglehub`, or `peft` — imported but undeclared.
+- Assuming `pip install -e .` supplies `kagglehub` or `peft` — imported but undeclared. (`huggingface_hub` is declared as `>=0.28.0`, but that floor does not satisfy `transformers`' own `huggingface-hub<2.0` requirement.)
 - Adding a lint/typecheck/CI config "to match other repos" — there is none here; pytest is the gate.
 - Training or calibrating on `eval_firewall/` — `resolve_shards` always excludes it.
 - Publishing a file path that does not exist in the repo — a broken reference fails silently.
