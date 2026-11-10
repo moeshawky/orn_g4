@@ -95,7 +95,19 @@ def build_frozen_mvp_layout(
     local_dir: str | Path = "/tmp/ornith-dataset",
     exclude_dirs: list[str] | None = None,
 ) -> DatasetLayout:
-    """Load the seven-shard frozen MVP directory, excluding persona and eval."""
+    """Load the seven-shard frozen MVP directory, excluding persona and eval.
+
+    The frozen dataset is treated as immutable: every shard is verified
+    against the SHA-256 proofs that already ship with the release, and no
+    dataset file is created, modified, or regenerated.
+
+    # Errors: raises :class:`orn_g4.errors.DatasetError` when the release
+    cannot be resolved, the MVP training subset is missing, the directory
+    holds unexpected Parquet files, no checksum proof is available, a shard
+    checksum mismatches, a shard lacks a required column, or ``pyarrow`` is
+    unavailable. Operator remediation: restore the release from the pinned
+    Hub revision; do not regenerate the proofs locally.
+    """
     root = Path(locate_dataset(source, local_dir=local_dir, revision=revision,
                                allow_drive_fallback=False)).resolve()
     if not root.is_dir():
@@ -147,7 +159,14 @@ def build_frozen_mvp_layout(
 
 
 def verify_frozen_template(dataset_root: str | Path, model_template_sha256: str) -> str:
-    """Check frozen Jinja bytes against model and template.sha256 when present."""
+    """Check frozen Jinja bytes against model and template.sha256 when present.
+
+    # Errors: raises :class:`orn_g4.errors.DatasetError` when the frozen
+    template file is missing, its bytes differ from the model's template
+    hash, or the ``template.sha256`` sidecar disagrees with those bytes.
+    Operator remediation: repin the dataset revision whose template matches
+    the model artifact.
+    """
     root = Path(dataset_root)
     template = root / "template" / "chat_template.jinja"
     if not template.is_file():
@@ -166,7 +185,14 @@ def verify_frozen_template(dataset_root: str | Path, model_template_sha256: str)
 
 
 def inspect_frozen_mvp(layout: DatasetLayout, *, expected_max_seq_len: int = 8192) -> dict[str, int]:
-    """Summarize the seven-shard training subset, never archive-wide persona totals."""
+    """Summarize the seven-shard training subset, never archive-wide persona totals.
+
+    # Errors: raises :class:`orn_g4.errors.DatasetError` when the layout holds
+    no shards, any shard is unverified, the subset does not contain exactly
+    seven shards, or the record total differs from the frozen release figure.
+    Operator remediation: rebuild the layout from the pinned release rather
+    than widening this check to archive-wide totals.
+    """
     if not layout.shards:
         raise DatasetError("empty frozen MVP training subset")
     if any(s.checksum_ok is not True for s in layout.shards):

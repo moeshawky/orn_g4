@@ -104,7 +104,12 @@ def locate_dataset(
     1. Direct local path (file or directory) if ``Path(source).exists()``.
     2. Hugging Face Hub snapshot download if ``source`` is an ``hf://`` URI,
        equals ``HF_DATASET_HANDLE``, or has an ``owner/repo`` format.
-    3. Google Drive fallback if ``DRIVE_DATASET_ZIP`` exists.
+    3. Google Drive fallback if ``DRIVE_DATASET_ZIP`` exists **and**
+       ``allow_drive_fallback`` is set.
+
+    ``revision`` pins the Hub snapshot to an immutable commit. The Google
+    Drive tier is opt-in, so a failed Hub resolution fails closed instead of
+    silently substituting a different dataset under the same handle.
 
     # Errors: raises :class:`DatasetError` when resolution fails across all tiers.
     """
@@ -123,7 +128,12 @@ def locate_dataset(
             return local_p.resolve()
 
     # 2. Hugging Face Hub
-    if is_hf or clean_repo == HF_DATASET_HANDLE or ("/" in clean_repo and not clean_repo.startswith("/")):
+    hf_candidate = (
+        is_hf
+        or clean_repo == HF_DATASET_HANDLE
+        or ("/" in clean_repo and not clean_repo.startswith("/"))
+    )
+    if hf_candidate:
         try:
             from huggingface_hub import snapshot_download
 
@@ -145,18 +155,36 @@ def locate_dataset(
     if allow_drive_fallback and drive_p.is_file():
         return drive_p.resolve()
 
+    checked = ["local filesystem"]
+    if hf_candidate:
+        checked.append(f"Hugging Face ({clean_repo})")
+    if allow_drive_fallback:
+        checked.append(f"Google Drive ({DRIVE_DATASET_ZIP})")
     raise DatasetError(
-        f"Dataset not found for source {source!r}. Checked local filesystem, "
-        f"Hugging Face ({clean_repo}), and Google Drive ({DRIVE_DATASET_ZIP})."
+        f"Dataset not found for source {source!r}. Checked "
+        + ", ".join(checked)
+        + "."
     )
 
 
 def import_dataset(
     source: str | Path = DEFAULT_DATASET_SOURCE,
     local_dir: str | Path = "/tmp/ornith-dataset",
+    *,
+    revision: str | None = None,
+    allow_drive_fallback: bool = False,
 ) -> Path:
-    """Top-level alias for :func:`locate_dataset`."""
-    return locate_dataset(source=source, local_dir=local_dir)
+    """Top-level alias for :func:`locate_dataset`.
+
+    # Errors: raises :class:`DatasetError` when the dataset cannot be resolved
+    from any enabled tier.
+    """
+    return locate_dataset(
+        source=source,
+        local_dir=local_dir,
+        revision=revision,
+        allow_drive_fallback=allow_drive_fallback,
+    )
 
 
 def locate_zip(zip_path: str | Path = "/content/drive/MyDrive/azrael-dataset.zip") -> Path:

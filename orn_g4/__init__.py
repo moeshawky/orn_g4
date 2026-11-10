@@ -4,6 +4,8 @@ Package implementing the work-order campaign:
   * modeling      — KaggleHub import + architecture discovery (§1)
   * template      — native chat-template inspection (§2)
   * data          — Google Drive nested-ZIP dataset import (§3)
+  * frozen_release — read-only frozen MVP shard/checksum verification
+  * source_contract — fail-closed Hub source pinning and release validation
   * env           — compute-environment inspection (§4)
   * lora          — short BF16 behavioral SFT + W_adapted parity (§5)
   * ternary_core  — grouped ternary representation & primitives (§6)
@@ -76,6 +78,7 @@ from .errors import (
     OrnG4Error,
     PackageResolutionError,
     RecoveryError,
+    SourceContractError,
     TemplateError,
     TernaryError,
 )
@@ -118,6 +121,7 @@ __all__ = [
     "ControllerError",
     "BudgetExceededError",
     "ChecksumMismatchError",
+    "SourceContractError",
     # controller
     "ExecutionController",
     "STAGE_ORDER",

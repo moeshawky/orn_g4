@@ -141,6 +141,22 @@ class ChecksumMismatchError(ControllerError):
     """
 
 
+class SourceContractError(OrnG4Error):
+    """A source, checkpoint, or dataset contract differs from the run lock.
+
+    # Errors: raised by :func:`orn_g4.source_contract.resolve_hub_sha`,
+    :func:`orn_g4.source_contract.enforce_source_lock`,
+    :func:`orn_g4.source_contract.validate_release`, or
+    :func:`orn_g4.source_contract.assert_template_alignment` when a Hub ref
+    resolves to no immutable commit SHA, a pinned input changed inside the
+    same run, a training shard escapes the training root or enters
+    ``eval_firewall``, a shard checksum is missing or mismatched, or the
+    pre-tokenized dataset chat template does not match the model's.
+    Operator remediation: pin a new immutable source in a new run directory,
+    or restore the originally locked revision.
+    """
+
+
 __all__ = [
     "OrnG4Error",
     "PackageResolutionError",
@@ -156,4 +172,5 @@ __all__ = [
     "ControllerError",
     "BudgetExceededError",
     "ChecksumMismatchError",
+    "SourceContractError",
 ]

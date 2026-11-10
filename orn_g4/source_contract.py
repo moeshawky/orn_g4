@@ -10,15 +10,18 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .errors import SourceContractError
+
 _SHA_RE = re.compile(r"^[a-fA-F0-9]{40}$")
 
 
-class SourceContractError(RuntimeError):
-    """A source, checkpoint, or dataset contract differs from the run lock."""
-
-
 def resolve_hub_sha(repo_id: str, repo_type: str, revision: str | None = None) -> str:
-    """Resolve a model/dataset ref to its immutable 40-digit HF commit SHA."""
+    """Resolve a model/dataset ref to its immutable 40-digit HF commit SHA.
+
+    # Errors: raises :class:`ValueError` for a repository type other than
+    "model" or "dataset", and :class:`orn_g4.errors.SourceContractError` when
+    the Hub returns no immutable commit SHA for the requested ref.
+    """
     if repo_type not in ("model", "dataset"):
         raise ValueError(f"unsupported Hub repository type: {repo_type!r}")
     from huggingface_hub import HfApi
@@ -36,7 +39,14 @@ def resolve_hub_sha(repo_id: str, repo_type: str, revision: str | None = None) -
 
 
 def enforce_source_lock(path: str | Path, name: str, repo_id: str, sha: str) -> dict[str, Any]:
-    """Atomically record an input SHA or reject a changed input for this run."""
+    """Atomically record an input SHA or reject a changed input for this run.
+
+    # Errors: raises :class:`ValueError` for a lock name other than "model" or
+    "dataset", and :class:`orn_g4.errors.SourceContractError` when the SHA is
+    not a 40-digit commit or when the pinned source changed inside the same
+    run. Operator remediation: start a new run directory for a new source
+    instead of re-locking an existing run.
+    """
     if name not in ("model", "dataset"):
         raise ValueError("source lock name must be model or dataset")
     if not _SHA_RE.fullmatch(str(sha)):
@@ -63,6 +73,13 @@ def validate_release(layout: Any, *, require_checksums: bool = True, max_sequenc
 
     Counts and hashes are checked against *this release's* manifest.  The old
     7-shard/17,848-record MVP is not treated as the current source of truth.
+
+    # Errors: raises :class:`orn_g4.errors.SourceContractError` when the
+    release resolves no shards, a shard escapes the training root or enters
+    ``eval_firewall``, a shard path repeats, a checksum is missing or
+    mismatched, the required array columns are absent, the manifest record
+    count disagrees with the summed shard rows, or the declared sequence
+    length exceeds the limit.
     """
     from .data import _rank_array_names
     if not layout.shards:
@@ -134,6 +151,14 @@ def dataset_template_hash(manifest: dict[str, Any]) -> str | None:
 
 
 def assert_template_alignment(manifest: dict[str, Any], actual_hash: str, *, require_declared_hash: bool) -> str | None:
+    """Compare the dataset's declared chat-template hash with the model's.
+
+    # Errors: raises :class:`orn_g4.errors.SourceContractError` when the
+    manifest declares no recognizable chat-template SHA-256 and
+    ``require_declared_hash`` is set, or when the declared hash differs from
+    the model's template hash. Operator remediation: regenerate the dataset
+    template from the pinned model revision rather than editing the hash.
+    """
     expected = dataset_template_hash(manifest)
     if expected is None:
         if require_declared_hash:
