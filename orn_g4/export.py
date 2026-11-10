@@ -359,7 +359,7 @@ def write_canonical_ternary_artifact(
         sf_dtype = "F32"
         if arr.dtype == np.float16:
             sf_dtype = "F16"
-        elif arr.dtype == np.bfloat16:
+        elif getattr(np, "bfloat16", None) is not None and arr.dtype == np.bfloat16:
             sf_dtype = "BF16"
         elif arr.dtype == np.float64:
             sf_dtype = "F64"

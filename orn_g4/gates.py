@@ -277,7 +277,7 @@ def gate_c_model_inference(
         arr = arrays[name]
         if arr.dtype != np.int8:
             continue
-        scales_key = name.replace("__codes", "__scales")
+        scales_key = f"{name}__scales"
         if scales_key not in arrays:
             continue
         codes = arr

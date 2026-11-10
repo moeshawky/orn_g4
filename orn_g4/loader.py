@@ -276,7 +276,7 @@ def load_ternary_checkpoint(
         if entry.is_quantized:
             # Dequantize: W_effective = scale × codes (+ residual if present).
             codes = arr.astype(np.int8)
-            scales_key = name
+            scales_key = f"{name}__scales"
             scales_arr = arrays.get(scales_key)
             if scales_arr is None:
                 # scales may be stored under a distinct key in residual_adapters;

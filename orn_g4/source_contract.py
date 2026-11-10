@@ -164,7 +164,8 @@ def assert_template_alignment(manifest: dict[str, Any], actual_hash: str, *, req
         if require_declared_hash:
             raise SourceContractError("release manifest does not declare a recognizable chat-template SHA-256")
         return None
-    if actual_hash.lower() != expected:
+    actual = actual_hash.removeprefix("sha256:").lower()
+    if actual != expected:
         raise SourceContractError(
             f"pre-tokenized dataset template hash {expected} does not match model's {actual_hash}"
         )
