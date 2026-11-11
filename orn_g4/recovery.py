@@ -634,6 +634,22 @@ def reconstruct_projection(
     Compatible with TernaryLinear (optimizing scales + lora_A/lora_B) and
     QTEALinear (optimizing col_v, group_alpha, and/or residual parameters).
     Ternary codes are verified to remain strictly frozen.
+
+    The report is honest about what happened: it names the recovery status
+    and the number of trainable tensors that actually changed. A run whose
+    parameters did not move (for example because the "teacher" was computed
+    from an already-quantized module) is reported as such and never as a
+    successful optimization.
+
+    Returns:
+        ``(unit, metrics)`` where metrics carries ``mse_before_recovery``,
+        ``mse_after_recovery``, ``recovery_steps``, ``parameters_updated``,
+        ``max_parameter_change``, ``grad_finite``, ``teacher_identical`` and
+        ``status``.
+
+    # Errors: raises RecoveryError when the reconstruction loss or the
+    gradients become non-finite, or when a frozen code/ residual index is
+    modified during the run.
     """
     import torch
     import torch.nn.functional as F
@@ -665,6 +681,12 @@ def reconstruct_projection(
             "mse_before_recovery": first_error,
             "mse_after_recovery": first_error,
             "recovery_steps": 0,
+            "parameters_updated": 0,
+            "max_parameter_change": 0.0,
+            "max_gradient_norm": 0.0,
+            "grad_finite": True,
+            "teacher_identical": first_error == 0.0,
+            "status": "no_parameters" if not parameters else "zero_steps",
         }
 
     starting_codes = (
@@ -672,8 +694,18 @@ def reconstruct_projection(
         if hasattr(unit, "codes")
         else (unit.ternary.detach().clone() if hasattr(unit, "ternary") else None)
     )
+    # Packed residual coordinates are frozen as well: a recovery pass must
+    # never rewrite the 1:4 sparse index layout or its scales.
+    frozen_residuals = {
+        name: getattr(unit, name).detach().clone()
+        for name in ("residual_index", "salient_cols", "residual_scale")
+        if hasattr(unit, name) and isinstance(getattr(unit, name), torch.Tensor)
+    }
+    starting_parameters = [p.detach().clone() for p in parameters]
 
     optimizer = torch.optim.AdamW(parameters, lr=float(lr), weight_decay=0.0)
+    grad_finite = True
+    max_gradient_norm = 0.0
     for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
         pred = unit(x).float()
@@ -684,6 +716,9 @@ def reconstruct_projection(
         grads = [p.grad for p in parameters if p.grad is not None]
         if not grads or any(not bool(torch.isfinite(g).all()) for g in grads):
             raise RecoveryError("Non-finite local reconstruction gradients")
+        grad_finite = all(bool(torch.isfinite(g).all()) for g in grads)
+        for g in grads:
+            max_gradient_norm = max(max_gradient_norm, float(g.norm()))
         torch.nn.utils.clip_grad_norm_(parameters, 1.0)
         optimizer.step()
         with torch.no_grad():
@@ -704,6 +739,31 @@ def reconstruct_projection(
         )
         if current_codes is not None and not torch.equal(current_codes, starting_codes):
             raise RecoveryError("Frozen ternary codes were modified during local reconstruction")
+    for name, snapshot in frozen_residuals.items():
+        current = getattr(unit, name, None)
+        if current is not None and not torch.equal(current.detach(), snapshot):
+            raise RecoveryError(
+                f"Frozen residual tensor {name!r} was modified during local reconstruction"
+            )
+
+    # Report what actually moved: an optimizer run that leaves every
+    # parameter untouched is not a successful recovery.
+    parameters_updated = 0
+    max_parameter_change = 0.0
+    with torch.no_grad():
+        for before, param in zip(starting_parameters, parameters):
+            if not torch.equal(before, param.detach()):
+                parameters_updated += 1
+                delta = float((before - param.detach()).abs().max())
+                max_parameter_change = max(max_parameter_change, delta)
+
+    teacher_identical = first_error == 0.0
+    if teacher_identical:
+        status = "degenerate_teacher"
+    elif parameters_updated == 0:
+        status = "no_change"
+    else:
+        status = "recovered"
 
     unit.eval()
     for p in unit.parameters():
@@ -713,6 +773,12 @@ def reconstruct_projection(
         "mse_before_recovery": first_error,
         "mse_after_recovery": final_error,
         "recovery_steps": steps,
+        "parameters_updated": parameters_updated,
+        "max_parameter_change": max_parameter_change,
+        "max_gradient_norm": max_gradient_norm,
+        "grad_finite": grad_finite,
+        "teacher_identical": teacher_identical,
+        "status": status,
     }
 
 

@@ -80,6 +80,7 @@ from .errors import (
     QualityGateError,
     QTEAError,
     RecoveryError,
+    RotationError,
     SourceContractError,
     TemplateError,
     TernaryError,
@@ -95,6 +96,14 @@ from .qtea import (
     pack_ternary,
     unpack_layer,
     unpack_ternary,
+)
+from .export import (
+    QTEA_OUTCOME_CONVERTED,
+    QTEA_OUTCOME_QUALITY_ACCEPTED,
+    QTEA_OUTCOME_QUALITY_REJECTED,
+    audit_qtea_conversion,
+    export_qtea_package,
+    verify_qtea_package,
 )
 
 __version__ = "2.0.0"
@@ -149,6 +158,13 @@ __all__ = [
     "pack_ternary",
     "unpack_layer",
     "unpack_ternary",
+    # qtea export
+    "export_qtea_package",
+    "verify_qtea_package",
+    "audit_qtea_conversion",
+    "QTEA_OUTCOME_CONVERTED",
+    "QTEA_OUTCOME_QUALITY_ACCEPTED",
+    "QTEA_OUTCOME_QUALITY_REJECTED",
     # controller
     "ExecutionController",
     "STAGE_ORDER",

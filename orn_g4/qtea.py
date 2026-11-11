@@ -48,6 +48,18 @@ FP8_MAX = _get_fp8_max()
 
 _POWERS_LIST = [1, 3, 9, 27, 81]
 
+#: Buffers of a packed QTEA layer, in canonical order.
+_LAYER_BUFFER_NAMES = (
+    "ternary",
+    "col_v",
+    "group_alpha",
+    "group_beta",
+    "salient_cols",
+    "residual_index",
+    "residual_value",
+    "residual_scale",
+)
+
 
 @dataclass
 class QTEAConfig:
@@ -280,8 +292,34 @@ class QTEA:
         )
 
     @torch.no_grad()
-    def quantize(self) -> Dict[str, Any]:
-        """Run the QTEA sweep, writes reconstructed weight to layer, and returns packed payload."""
+    def quantize(self, *, mutate_source: bool = False) -> Dict[str, Any]:
+        """Run the QTEA sweep and return the packed payload.
+
+        The source ``nn.Linear`` is **not** modified by default: the original
+        BF16 module must stay an immutable teacher for the whole conversion so
+        that teacher activations are computed from the un-quantized weights.
+        The reconstructed dense weight is returned in the payload under
+        ``"dequantized_weight"`` (kept on the compute device) instead of being
+        written back into the module.
+
+        Args:
+            mutate_source: opt-in legacy behaviour. When True the dequantized
+                weight is written back into ``self.layer.weight.data``. This
+                mutates the teacher module and must not be used when the
+                source weights are needed as a teacher.
+
+        Returns:
+            The payload dict (keys ``rows``, ``cols``, ``group_size``,
+            ``residual_group``, ``ternary``, ``col_v``, ``group_alpha``,
+            ``group_beta``, ``salient_cols``, ``residual_index``,
+            ``residual_value``, ``residual_scale``) plus
+            ``"dequantized_weight"``.
+
+        # Errors: raises ValueError when the layer geometry is incompatible
+        with the configured group size / residual group (raised at
+        construction), and QTEAError is not raised here; the sweep itself
+        raises the underlying torch errors unchanged.
+        """
         cfg = self.config
         W = self.layer.weight.data.clone().float()
         H = (
@@ -366,9 +404,12 @@ class QTEA:
             W[:, stop:] -= block_err.matmul(Hinv[start:stop, stop:])
 
         dequantized = Q[:, inverse_order].reshape(self.layer.weight.shape)
-        self.layer.weight.data = dequantized.to(self.layer.weight.dtype)
+        if mutate_source:
+            # Opt-in only: overwrites the teacher weights with the
+            # dequantized reconstruction.
+            self.layer.weight.data = dequantized.to(self.layer.weight.dtype)
 
-        return self._payload(
+        payload = self._payload(
             groups,
             codes_all,
             v_all,
@@ -377,6 +418,8 @@ class QTEA:
             residuals,
             residual_scales,
         )
+        payload["dequantized_weight"] = dequantized
+        return payload
 
     def _payload(
         self,
@@ -512,29 +555,90 @@ def pack_layer(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _layer_device(layer: Dict[str, Any]) -> torch.device:
+    """Canonical device of a packed layer dict.
+
+    The device is taken from the packed codes (``ternary``) and falls back to
+    the dense-scale tensors and then to CPU. Every temporary allocated while
+    decoding a layer must live on this device, otherwise a GPU-resident layer
+    materializes CPU temporaries and the scatter either fails or silently
+    produces a CPU result.
+
+    # Errors: none; an empty layer resolves to CPU.
+    """
+    for key in ("ternary", "group_alpha", "group_beta", "col_v"):
+        tensor = layer.get(key)
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device
+    return torch.device("cpu")
+
+
+def _resolve_device(device: Optional[Any], payload: Dict[str, Any]) -> torch.device:
+    """Resolve the target device for a payload: explicit argument, else payload's own.
+
+    # Errors: none; falls back to CPU when nothing carries a device.
+    """
+    if device is not None:
+        return torch.device(device)
+    for key in ("ternary", "group_alpha", "col_v"):
+        tensor = payload.get(key)
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device
+    return torch.device("cpu")
+
+
 def residual_columns(layer: Dict[str, Any]) -> torch.Tensor:
-    """Dense (n_salient, rows) residual of a packed layer in FP32."""
-    if layer["residual_value"].numel() == 0:
-        return torch.zeros(0, layer["rows"])
+    """Dense (n_salient, rows) residual of a packed layer in FP32.
+
+    Every temporary (the dense scatter buffer, the unpacked indices and the
+    scale) is allocated on the device that holds the residual payload, so a
+    CUDA-resident layer never materializes a CPU intermediate.
+
+    # Errors: raises RuntimeError when the layer mixes devices between
+    ``residual_index`` and ``residual_value`` and the caller did not align
+    them; ``unpack_layer`` aligns them before calling this helper.
+    """
+    residual_value = layer["residual_value"]
+    if residual_value.numel() == 0:
+        return torch.zeros(0, layer["rows"], device=residual_value.device)
 
     packed = layer["residual_index"].int()
     shifts = [0, 2, 4, 6]
     index = torch.stack([(packed >> s) & 0x3 for s in shifts], dim=2).reshape(
         packed.shape[0], -1
     )
-    scale = layer["residual_scale"][:, None]
-    value = layer["residual_value"].float() / scale
+    scale = layer["residual_scale"].to(residual_value.device)[:, None]
+    value = residual_value.float() / scale
 
-    dense = torch.zeros(value.shape[0], value.shape[1], layer["residual_group"])
+    dense = torch.zeros(
+        value.shape[0],
+        value.shape[1],
+        layer["residual_group"],
+        device=value.device,
+        dtype=value.dtype,
+    )
     valid_cols = min(value.shape[1], index.shape[1])
     dense.scatter_(
-        2, index[:, :valid_cols, None].long(), value[:, :valid_cols, None]
+        2,
+        index.to(value.device)[:, :valid_cols, None].long(),
+        value[:, :valid_cols, None],
     )
     return dense.reshape(value.shape[0], -1)
 
 
 def unpack_layer(layer: Dict[str, Any]) -> torch.Tensor:
-    """Reconstruct dense FP32 weight matrix from a packed QTEA layer."""
+    """Reconstruct dense FP32 weight matrix from a packed QTEA layer.
+
+    All temporaries follow the layer's own device: the decoded codes, the
+    group scales, the column rescale and the salient-column indices. A
+    GPU-resident layer therefore reconstructs without a host round-trip.
+
+    # Errors: raises RuntimeError on shape mismatches between the payload
+    fields (rows/cols/group_size/residual_group); no third-party exception is
+    swallowed.
+    """
+    device = _layer_device(layer)
+
     if layer["ternary"].dtype == torch.uint8:
         codes = unpack_ternary(
             layer["ternary"], layer["cols"], layer["group_size"]
@@ -544,11 +648,12 @@ def unpack_layer(layer: Dict[str, Any]) -> torch.Tensor:
 
     alpha = layer["group_alpha"].repeat_interleave(layer["group_size"], dim=1)
     beta = layer["group_beta"].repeat_interleave(layer["group_size"], dim=1)
+    col_v = layer["col_v"]
 
-    weight = alpha * layer["col_v"][None, :] * codes + beta
-    salient = layer["salient_cols"].long()
-    if salient.numel() > 0:
-        weight[:, salient] += residual_columns(layer).t()
+    weight = alpha * col_v.to(device)[None, :] * codes.to(device) + beta.to(device)
+    salient = layer["salient_cols"].to(device).long()
+    if salient.numel() > 0 and layer["residual_value"].numel() > 0:
+        weight[:, salient] += residual_columns(layer).to(device).t()
     return weight
 
 
@@ -638,26 +743,53 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
 
     @classmethod
     def from_payload(
-        cls, payload: Dict[str, Any], bias: Optional[torch.Tensor] = None
+        cls,
+        payload: Dict[str, Any],
+        bias: Optional[torch.Tensor] = None,
+        device: Optional[Any] = None,
     ) -> "QTEALinear":
-        """Instantiate QTEALinear from a packed layer payload."""
+        """Instantiate QTEALinear from a packed layer payload.
+
+        Every buffer is placed on a single device — ``device`` when given,
+        otherwise the device the payload itself lives on — so the decoded
+        layer never mixes devices (a mixed layer makes the salient-column
+        scatter operate against a weight of a different device).
+
+        Args:
+            payload: packed layer dict as produced by :func:`pack_layer`.
+            bias: optional bias tensor; copied (never aliased) into the new
+                module.
+            device: optional target device for the module.
+
+        Returns:
+            A :class:`QTEALinear` whose buffers carry the payload contents.
+
+        # Errors: raises RuntimeError when a payload field has a shape that
+        is incompatible with the module geometry; the payload shapes are
+        authoritative and replace the placeholder buffers.
+        """
+        target = _resolve_device(device, payload)
         layer = cls(
             in_features=payload["cols"],
             out_features=payload["rows"],
             group_size=payload["group_size"],
             residual_group=payload["residual_group"],
             bias=bias is not None,
+            device=target,
         )
-        layer.ternary.copy_(payload["ternary"])
-        layer.col_v.copy_(payload["col_v"])
-        layer.group_alpha.copy_(payload["group_alpha"])
-        layer.group_beta.copy_(payload["group_beta"])
-        layer.salient_cols = payload["salient_cols"].clone()
-        layer.residual_index = payload["residual_index"].clone()
-        layer.residual_value = payload["residual_value"].clone()
-        layer.residual_scale = payload["residual_scale"].clone()
+        for name in _LAYER_BUFFER_NAMES:
+            source = payload.get(name)
+            if source is None:
+                continue
+            if not isinstance(source, torch.Tensor):
+                raise QTEAError(
+                    f"payload field {name!r} is not a tensor: {type(source)!r}"
+                )
+            # Replace the placeholder buffer wholesale so the payload shape
+            # and dtype win, and the whole layer stays on one device.
+            setattr(layer, name, source.to(device=target))
         if bias is not None and layer.bias is not None:
-            layer.bias.data.copy_(bias)
+            layer.bias.data.copy_(bias.to(device=target))
         return layer
 
     def to_layer_dict(self) -> Dict[str, Any]:
@@ -753,13 +885,35 @@ def calibrate_and_quantize_projection(
     module: nn.Linear,
     calibration_batches: List[torch.Tensor],
     config: Optional[QTEAConfig] = None,
+    *,
+    mutate_source: bool = False,
 ) -> Tuple[Dict[str, Any], QTEALinear]:
-    """Quantize one linear projection using upstream QTEA and return (packed_layer, QTEALinear)."""
+    """Quantize one linear projection using upstream QTEA and return (packed_layer, QTEALinear).
+
+    The source ``module`` is left untouched by default: its weight and bias
+    stay available as an immutable BF16 teacher for the whole conversion.
+    The returned :class:`QTEALinear` owns its own storage and computes its
+    output from the packed QTEA representation.
+
+    Args:
+        name: projection name (used for provenance/bookkeeping only).
+        module: source ``nn.Linear`` to quantize.
+        calibration_batches: activation batches folded into the Hessian.
+        config: optional :class:`QTEAConfig` override.
+        mutate_source: opt-in legacy behaviour that writes the dequantized
+            weight back into ``module`` (destroys the teacher). Default False.
+
+    Returns:
+        ``(packed_layer, qtea_module)``.
+
+    # Errors: raises QTEAError when PyTorch is unavailable; raises ValueError
+    when the layer geometry is incompatible with the configured group size.
+    """
     cfg = config or QTEAConfig()
     quantizer = QTEA(module, cfg)
     for batch in calibration_batches:
         quantizer.add_batch(batch)
-    payload = quantizer.quantize()
+    payload = quantizer.quantize(mutate_source=mutate_source)
     packed = pack_layer(payload)
     qtea_mod = QTEALinear.from_payload(
         packed, bias=module.bias.data if module.bias is not None else None

@@ -15,12 +15,13 @@ class OrnG4Error(Exception):
 
 
 class PackageResolutionError(OrnG4Error):
-    """The `orn_g4` package could not be imported from any candidate root.
+    """A package candidate root was unusable.
 
-    # Errors: raised by :func:`orn_g4.utils.resolve_package_root` when none of
-    ORN_G4_ROOT, /content/orn_g4, /content/Azrael-g4, or a Drive run-directory
-    snapshot resolves. Operator remediation: upload the Azrael-g4 folder into
-    Colab (or set ORN_G4_ROOT) — see Azrael-g4/README.md.
+    # Errors: raised by a notebook-side environment probe when none of the
+    candidate roots (ORN_G4_ROOT, /content/orn_g4, /content/Azrael-g4, a Drive
+    run-directory snapshot) resolves. No in-package caller raises it today.
+    Operator remediation: upload the Azrael-g4 folder into Colab or set
+    ORN_G4_ROOT (see Azrael-g4/README.md).
     """
 
 
@@ -65,7 +66,7 @@ class DataAlignmentError(OrnG4Error):
 class LoRAError(OrnG4Error):
     """LoRA application, coverage measurement, or virtual-merge parity failed.
 
-    # Errors: raised by :func:`orn_g4.lora.apply_lora`,
+    # Errors: raised by :func:`orn_g4.lora.apply_lora_to_model`,
     :func:`orn_g4.lora.measure_coverage`, or :func:`orn_g4.lora.virtual_merge_parity`
     when target modules are not found, frozen modules receive grads, or the
     adapted matrix diverges beyond tolerance.
@@ -75,9 +76,9 @@ class LoRAError(OrnG4Error):
 class TernaryError(OrnG4Error):
     """Ternary conversion or reconstruction failed.
 
-    # Errors: raised by :func:`orn_g4.ternary.group_scales`,
-    :func:`orn_g4.ternary.hard_ternary_forward`, or
-    :func:`orn_g4.ternary.sequential_gptq` when group axes are inconsistent,
+    # Errors: raised by :func:`orn_g4.ternary_core.group_scales`,
+    :func:`orn_g4.ternary_core.hard_ternary_forward`, or
+    :func:`orn_g4.ternary_gptq.sequential_gptq` when group axes are inconsistent,
     codes leave {-1,0,+1}, or reconstruction exceeds the declared budget.
     """
 
@@ -85,7 +86,7 @@ class TernaryError(OrnG4Error):
 class RotationError(OrnG4Error):
     """Hadamard rotation or its inverse failed parity.
 
-    # Errors: raised by :func:`orn_g4.rotation.apply_hadamard` or
+    # Errors: raised by :func:`orn_g4.rotation.rotate_weights` or
     :func:`orn_g4.rotation.verify_inverse` when rotation+inverse does not
     reproduce the input within tolerance, or when the rotation cannot be
     represented faithfully by the inference path.
@@ -97,7 +98,7 @@ class RecoveryError(OrnG4Error):
 
     # Errors: raised by :func:`orn_g4.recovery.scale_distillation`,
     :func:`orn_g4.recovery.low_rank_residual`, or
-    :func:`orn_g4.recovery.selective_qat` when gradients become non-finite,
+    :func:`orn_g4.recovery.train_qat` when gradients become non-finite,
     held-out behavior regresses beyond tolerance, or absorption claims cannot
     be reproduced by the hard-ternary export.
     """
@@ -123,7 +124,7 @@ class QTEAError(OrnG4Error):
 class ExportError(OrnG4Error):
     """Artifact export or reload failed.
 
-    # Errors: raised by :func:`orn_g4.export.write_canonical_checkpoint`,
+    # Errors: raised by :func:`orn_g4.export.write_canonical_ternary_checkpoint`,
     :func:`orn_g4.export.load_effective_ternary`, or
     :func:`orn_g4.export.pack_ptq1_0` when the packed/ ternary checkpoint does
     not round-trip, or when unchanged FP source weights would be serialized

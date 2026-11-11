@@ -1,5 +1,6 @@
 """Unit tests for orn_g4.qtea, recovery extensions, gates, and packaging."""
 
+import json
 import math
 import shutil
 from pathlib import Path
@@ -15,7 +16,7 @@ from orn_g4.checkpoint_spec import (
     QTEACheckpointSpec,
     TensorEntry,
 )
-from orn_g4.errors import QualityGateError, QTEAError
+from orn_g4.errors import ExportError, QualityGateError, QTEAError
 from orn_g4.export import export_qtea_package
 from orn_g4.gates import gate_ce_quality, gate_logits_parity, gate_top1_parity
 from orn_g4.qtea import (
@@ -258,17 +259,40 @@ def test_export_qtea_package(tmp_path):
     assert (pkg_dir / "manifest.json").is_file()
     assert (pkg_dir / "provenance_lock.json").is_file()
     assert (pkg_dir / "ternary_runtime.py").is_file()
+    assert (pkg_dir / "load_qtea_package.py").is_file()
     assert (pkg_dir / "assets" / "config.json").is_file()
     assert (run_dir / "test_qtea_run_package.tar.gz").is_file()
+    assert manifest["outcome"] == "QUALITY_ACCEPTED"
 
-    # Verify quality gate rejects excessive regression
-    bad_res = {"delta_ce": 0.65}
+    # Verify quality gate rejects excessive regression. The artifact is still
+    # preserved (preservation is separate from acceptance), but the export
+    # refuses to approve the package.
+    bad_res = {"delta_ce": 0.65, "teacher_ce": 1.0, "student_ce": 1.65}
     with pytest.raises(QualityGateError, match="Export refused"):
         export_qtea_package(
             model,
             run_dir,
             index,
             bad_res,
+            src_dir,
+            ce_max_regression=0.50,
+        )
+
+    # A quality-rejected artifact is preserved for the recovery phase.
+    rejected_dir = run_dir / "candidate"
+    rejected_manifest = json.loads((rejected_dir / "manifest.json").read_text())
+    assert rejected_manifest["outcome"] == "QUALITY_REJECTED_RECOVERY_REQUIRED"
+    assert rejected_manifest["quality"]["delta_ce"] == pytest.approx(0.65)
+    assert rejected_manifest["quality"]["ce_max_regression"] == pytest.approx(0.50)
+
+    # Missing quality measurements are rejected outright: a missing
+    # measurement must never read as "no degradation".
+    with pytest.raises(ExportError, match="quality measurements missing"):
+        export_qtea_package(
+            model,
+            run_dir,
+            index,
+            {"delta_ce": 0.65},
             src_dir,
             ce_max_regression=0.50,
         )
