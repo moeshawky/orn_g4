@@ -103,6 +103,23 @@ class RecoveryError(OrnG4Error):
     """
 
 
+class QualityGateError(OrnG4Error):
+    """Quality gate validation failed.
+
+    # Errors: raised by :func:`orn_g4.gates.gate_ce_quality` or
+    :func:`orn_g4.gates.gate_logits_parity` when cross-entropy degradation
+    exceeds threshold or logits divergence exceeds tolerance.
+    """
+
+
+class QTEAError(OrnG4Error):
+    """QTEA quantization, calibration, or packing failed.
+
+    # Errors: raised by :class:`orn_g4.qtea.QTEA` or :func:`orn_g4.qtea.pack_layer`
+    when dimensions are invalid or quantization diverges.
+    """
+
+
 class ExportError(OrnG4Error):
     """Artifact export or reload failed.
 

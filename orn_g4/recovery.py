@@ -622,6 +622,100 @@ def train_qat(
     return result
 
 
+def reconstruct_projection(
+    unit: Any,
+    x: Any,
+    teacher_y: Any,
+    steps: int = 3,
+    lr: float = 3e-5,
+) -> tuple[Any, dict[str, Any]]:
+    """Run local reconstruction updates on trainable parameters of a quantized module against teacher outputs.
+
+    Compatible with TernaryLinear (optimizing scales + lora_A/lora_B) and
+    QTEALinear (optimizing col_v, group_alpha, and/or residual parameters).
+    Ternary codes are verified to remain strictly frozen.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    with torch.no_grad():
+        initial_pred = unit(x).float()
+        first_error = float(F.mse_loss(initial_pred, teacher_y).item())
+
+    # Collect parameters requiring gradients
+    parameters: list[torch.Tensor] = []
+    if hasattr(unit, "scales") and isinstance(unit.scales, torch.nn.Parameter):
+        unit.scales.requires_grad_(True)
+        parameters.append(unit.scales)
+    if hasattr(unit, "lora_A") and isinstance(unit.lora_A, torch.nn.Parameter):
+        unit.lora_A.requires_grad_(True)
+        parameters.append(unit.lora_A)
+    if hasattr(unit, "lora_B") and isinstance(unit.lora_B, torch.nn.Parameter):
+        unit.lora_B.requires_grad_(True)
+        parameters.append(unit.lora_B)
+
+    # For QTEALinear, make col_v and/or group_alpha trainable parameters during local recovery if present
+    if hasattr(unit, "col_v") and isinstance(unit.col_v, torch.Tensor) and not parameters:
+        col_v_param = torch.nn.Parameter(unit.col_v.clone())
+        unit.col_v = col_v_param
+        parameters.append(col_v_param)
+
+    if not parameters or steps <= 0:
+        return unit, {
+            "mse_before_recovery": first_error,
+            "mse_after_recovery": first_error,
+            "recovery_steps": 0,
+        }
+
+    starting_codes = (
+        unit.codes.detach().clone()
+        if hasattr(unit, "codes")
+        else (unit.ternary.detach().clone() if hasattr(unit, "ternary") else None)
+    )
+
+    optimizer = torch.optim.AdamW(parameters, lr=float(lr), weight_decay=0.0)
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        pred = unit(x).float()
+        loss = F.mse_loss(pred, teacher_y)
+        if not bool(torch.isfinite(loss)):
+            raise RecoveryError("Non-finite local reconstruction loss")
+        loss.backward()
+        grads = [p.grad for p in parameters if p.grad is not None]
+        if not grads or any(not bool(torch.isfinite(g).all()) for g in grads):
+            raise RecoveryError("Non-finite local reconstruction gradients")
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+        optimizer.step()
+        with torch.no_grad():
+            if hasattr(unit, "scales") and unit.scales is not None:
+                unit.scales.clamp_(min=1e-8)
+            if hasattr(unit, "col_v") and unit.col_v is not None:
+                unit.col_v.clamp_(min=1e-8)
+
+    with torch.no_grad():
+        final_pred = unit(x).float()
+        final_error = float(F.mse_loss(final_pred, teacher_y).item())
+
+    if starting_codes is not None:
+        current_codes = (
+            unit.codes
+            if hasattr(unit, "codes")
+            else getattr(unit, "ternary", None)
+        )
+        if current_codes is not None and not torch.equal(current_codes, starting_codes):
+            raise RecoveryError("Frozen ternary codes were modified during local reconstruction")
+
+    unit.eval()
+    for p in unit.parameters():
+        p.requires_grad_(False)
+
+    return unit, {
+        "mse_before_recovery": first_error,
+        "mse_after_recovery": final_error,
+        "recovery_steps": steps,
+    }
+
+
 __all__ = [
     "ScaleDistillationResult",
     "ResidualResult",
@@ -637,4 +731,5 @@ __all__ = [
     "setup_qat",
     "train_recovery",
     "train_qat",
+    "reconstruct_projection",
 ]

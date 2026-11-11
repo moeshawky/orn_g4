@@ -77,10 +77,24 @@ from .errors import (
     ModelSourceError,
     OrnG4Error,
     PackageResolutionError,
+    QualityGateError,
+    QTEAError,
     RecoveryError,
     SourceContractError,
     TemplateError,
     TernaryError,
+)
+from .qtea import (
+    QTEA,
+    QTEAConfig,
+    QTEALinear,
+    TernaryGroup,
+    calibrate_and_quantize_projection,
+    find_ornith_projections,
+    pack_layer,
+    pack_ternary,
+    unpack_layer,
+    unpack_ternary,
 )
 
 __version__ = "2.0.0"
@@ -122,6 +136,19 @@ __all__ = [
     "BudgetExceededError",
     "ChecksumMismatchError",
     "SourceContractError",
+    "QualityGateError",
+    "QTEAError",
+    # qtea
+    "QTEA",
+    "QTEAConfig",
+    "QTEALinear",
+    "TernaryGroup",
+    "calibrate_and_quantize_projection",
+    "find_ornith_projections",
+    "pack_layer",
+    "pack_ternary",
+    "unpack_layer",
+    "unpack_ternary",
     # controller
     "ExecutionController",
     "STAGE_ORDER",

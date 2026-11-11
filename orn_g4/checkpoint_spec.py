@@ -37,6 +37,8 @@ SCHEMA_VERSION = "ternary/v1"
 #: Quantizer identity constants.
 QUANTIZER_STE = "ste"
 QUANTIZER_GPTQ = "sequential_gptq_group128"
+QUANTIZER_QTEA = "qtea"
+SCHEMA_VERSION_QTEA = "qtea/v1"
 
 #: Code representation constants.
 CODE_DTYPE = "int8"  # codes ∈ {-1, 0, +1}, stored as int8
@@ -174,6 +176,75 @@ class CanonicalTernarySpec:
             precision_exceptions=list(d.get("precision_exceptions", [])),
             residual_adapters=d.get("residual_adapters", {}),
             recovered_scales={},  # arrays loaded separately from shards
+            effective_bits_per_weight=d.get("effective_bits_per_weight"),
+        )
+
+
+@dataclass(frozen=True)
+class QTEACheckpointSpec:
+    """Canonical QTEA checkpoint specification (versioned, standalone)."""
+
+    schema_version: str = SCHEMA_VERSION_QTEA
+    model_config: dict[str, Any] = field(default_factory=dict)
+    qtea_config: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
+    tensors: dict[str, TensorEntry] = field(default_factory=dict)
+    quality_metrics: dict[str, float] = field(default_factory=dict)
+    effective_bits_per_weight: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize QTEA spec to JSON-serializable dictionary."""
+        return {
+            "schema_version": self.schema_version,
+            "model_config": self.model_config,
+            "qtea_config": self.qtea_config,
+            "provenance": self.provenance,
+            "tensors": {
+                name: {
+                    "tensor_name": e.tensor_name,
+                    "shape": list(e.shape),
+                    "dtype": e.dtype,
+                    "group_axis": e.group_axis,
+                    "group_size": e.group_size,
+                    "n_groups": e.n_groups,
+                    "quantizer": e.quantizer,
+                    "quantizer_config": e.quantizer_config,
+                    "is_quantized": e.is_quantized,
+                    "is_precision_exception": e.is_precision_exception,
+                    "shard_file": e.shard_file,
+                }
+                for name, e in self.tensors.items()
+            },
+            "quality_metrics": self.quality_metrics,
+            "effective_bits_per_weight": self.effective_bits_per_weight,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> QTEACheckpointSpec:
+        """Reconstruct QTEACheckpointSpec from JSON dict."""
+        tensors = {
+            name: TensorEntry(
+                tensor_name=v["tensor_name"],
+                shape=tuple(int(x) for x in v["shape"]),
+                dtype=v["dtype"],
+                group_axis=v["group_axis"],
+                group_size=int(v["group_size"]),
+                n_groups=int(v["n_groups"]),
+                quantizer=v.get("quantizer"),
+                quantizer_config=v.get("quantizer_config", {}),
+                is_quantized=bool(v.get("is_quantized", False)),
+                is_precision_exception=bool(v.get("is_precision_exception", False)),
+                shard_file=v.get("shard_file"),
+            )
+            for name, v in d.get("tensors", {}).items()
+        }
+        return cls(
+            schema_version=str(d.get("schema_version", SCHEMA_VERSION_QTEA)),
+            model_config=d.get("model_config", {}),
+            qtea_config=d.get("qtea_config", {}),
+            provenance=d.get("provenance", {}),
+            tensors=tensors,
+            quality_metrics=d.get("quality_metrics", {}),
             effective_bits_per_weight=d.get("effective_bits_per_weight"),
         )
 
@@ -434,12 +505,15 @@ def _dtype_for_tensor_entry(entry: TensorEntry | None, arr_dtype: np.dtype[Any])
 
 __all__ = [
     "SCHEMA_VERSION",
+    "SCHEMA_VERSION_QTEA",
     "QUANTIZER_STE",
     "QUANTIZER_GPTQ",
+    "QUANTIZER_QTEA",
     "CODE_DTYPE",
     "TensorEntry",
     "RotationMetadata",
     "CanonicalTernarySpec",
+    "QTEACheckpointSpec",
     "tensor_entry_for_ternary",
     "tensor_entry_for_preserved",
     "validate_standalone_completeness",

@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -830,6 +831,249 @@ def load_effective_ternary(checkpoint_dir: Path | str) -> tuple[dict, dict]:
     return cp, tensors
 
 
+def export_qtea_package(
+    model: Any,
+    run_dir: Path | str,
+    index: dict[str, Any],
+    conversion_result: dict[str, Any],
+    source_dir: Path | str,
+    *,
+    ce_max_regression: float = 0.50,
+    qtea_config: Any = None,
+    mode: str = "PILOT",
+    run_tag: str = "ornith_qtea_v2_1",
+    provenance: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Export a standalone, portable QTEA candidate package.
+
+    Enforces the quality gate (delta_ce <= ce_max_regression), saves encoded
+    QTEA projections and preserved base tensors, writes a self-contained runtime,
+    generates manifest and provenance locks, and builds the deployable archive.
+    """
+    from .errors import ExportError, QualityGateError
+    from .gates import gate_ce_quality
+    from .qtea import QTEALinear, pack_layer, unpack_layer
+
+    delta_ce = float(conversion_result.get("delta_ce", 0.0))
+    if delta_ce > ce_max_regression:
+        raise QualityGateError(
+            f"Export refused: delta_ce={delta_ce:.4f} exceeds threshold {ce_max_regression:.4f}"
+        )
+
+    package_dir = Path(run_dir) / "candidate"
+    assets_dir = package_dir / "assets"
+    encoded_dir = package_dir / "encoded"
+    preserved_dir = package_dir / "preserved"
+
+    for d in (package_dir, assets_dir, encoded_dir, preserved_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    src_p = Path(source_dir)
+    # Copy configuration and tokenizer assets
+    if src_p.is_dir():
+        for asset in src_p.iterdir():
+            if asset.is_file() and (
+                asset.suffix in (".json", ".txt", ".model", ".jinja")
+                or asset.name.startswith("tokenizer")
+            ):
+                shutil.copy2(asset, assets_dir / asset.name)
+
+    # Save completed QTEA projections
+    encoded_manifest: dict[str, Any] = {}
+    completed_targets = index.get("completed", {})
+    for name in completed_targets:
+        mod = model.get_submodule(name)
+        slug = f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.safetensors"
+        out_file = encoded_dir / slug
+
+        if isinstance(mod, QTEALinear):
+            layer_dict = mod.to_layer_dict()
+            tensors_to_save: dict[str, Any] = {
+                "ternary": layer_dict["ternary"],
+                "col_v": layer_dict["col_v"],
+                "group_alpha": layer_dict["group_alpha"],
+                "group_beta": layer_dict["group_beta"],
+                "salient_cols": layer_dict["salient_cols"],
+                "residual_index": layer_dict["residual_index"],
+                "residual_scale": layer_dict["residual_scale"],
+            }
+            if layer_dict["residual_value"].numel() > 0:
+                tensors_to_save["residual_value"] = layer_dict["residual_value"]
+            if mod.bias is not None:
+                tensors_to_save["bias"] = mod.bias
+        else:
+            # Baseline TernaryLinear fallback
+            tensors_to_save = {
+                "codes": mod.codes,
+                "scales": mod.scales,
+            }
+            if getattr(mod, "bias", None) is not None:
+                tensors_to_save["bias"] = mod.bias
+            if getattr(mod, "lora_A", None) is not None and getattr(mod, "lora_B", None) is not None:
+                tensors_to_save["lora_A"] = mod.lora_A
+                tensors_to_save["lora_B"] = mod.lora_B
+
+        # Save using safetensors or torch
+        try:
+            from safetensors.torch import save_file
+            save_file({k: v.cpu() for k, v in tensors_to_save.items()}, str(out_file))
+        except ImportError:
+            torch.save({k: v.cpu() for k, v in tensors_to_save.items()}, str(out_file))
+
+        digest = hashlib.sha256(out_file.read_bytes()).hexdigest()
+        encoded_manifest[name] = {"file": slug, "sha256": digest}
+
+    # Save preserved tensors
+    preserved_tensors: dict[str, Any] = {}
+    completed_names = set(completed_targets.keys())
+    for name, param in model.named_parameters():
+        root_mod = ".".join(name.split(".")[:-1])
+        if root_mod in completed_names:
+            continue
+        preserved_tensors[name] = param.detach().cpu()
+
+    preserved_manifest: dict[str, Any] = {}
+    if preserved_tensors:
+        pres_file = preserved_dir / "preserved.safetensors"
+        try:
+            from safetensors.torch import save_file
+            save_file(preserved_tensors, str(pres_file))
+        except ImportError:
+            torch.save(preserved_tensors, str(pres_file))
+        preserved_manifest["preserved.safetensors"] = {
+            "sha256": hashlib.sha256(pres_file.read_bytes()).hexdigest(),
+            "count": len(preserved_tensors),
+        }
+
+    # Write self-contained ternary_runtime.py
+    runtime_py = package_dir / "ternary_runtime.py"
+    runtime_py.write_text(
+        r'''"""Self-contained runtime module for TernaryLinear and QTEALinear projections."""
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+_POWERS = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32)
+
+def unpack_ternary(packed, cols, group_size=128):
+    rows = packed.shape[0]
+    bytes_per_group = (group_size + 4) // 5
+    powers = _POWERS.to(packed.device)
+    values = packed.reshape(rows, -1, 1).int()
+    digits = (values // powers) % 3 - 1
+    digits = digits.reshape(rows, -1, bytes_per_group * 5)[:, :, :group_size]
+    return digits.reshape(rows, cols).to(torch.int8)
+
+class QTEALinear(nn.Module):
+    def __init__(self, in_features, out_features, group_size=128, residual_group=4, bias=False, device="cpu"):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.group_size = int(group_size)
+        self.residual_group = int(residual_group)
+        bytes_per_group = (self.group_size + 4) // 5
+        n_groups = math.ceil(self.in_features / self.group_size)
+        self.register_buffer("ternary", torch.zeros(self.out_features, n_groups * bytes_per_group, dtype=torch.uint8, device=device))
+        self.register_buffer("col_v", torch.ones(self.in_features, dtype=torch.float32, device=device))
+        self.register_buffer("group_alpha", torch.ones(self.out_features, n_groups, dtype=torch.float32, device=device))
+        self.register_buffer("group_beta", torch.zeros(self.out_features, n_groups, dtype=torch.float32, device=device))
+        self.register_buffer("salient_cols", torch.zeros(0, dtype=torch.int32, device=device))
+        self.register_buffer("residual_index", torch.zeros(0, 0, dtype=torch.uint8, device=device))
+        self.register_buffer("residual_value", torch.zeros(0, 0, device=device))
+        self.register_buffer("residual_scale", torch.zeros(0, dtype=torch.float32, device=device))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.out_features, device=device, dtype=torch.float32))
+        else:
+            self.register_parameter("bias", None)
+
+    def effective_weight(self, dtype=torch.float32):
+        codes = unpack_ternary(self.ternary, self.in_features, self.group_size).float()
+        alpha = self.group_alpha.repeat_interleave(self.group_size, dim=1)
+        beta = self.group_beta.repeat_interleave(self.group_size, dim=1)
+        w = alpha * self.col_v[None, :] * codes + beta
+        if self.salient_cols.numel() > 0 and self.residual_value.numel() > 0:
+            packed = self.residual_index.int()
+            shifts = [0, 2, 4, 6]
+            idx = torch.stack([(packed >> s) & 0x3 for s in shifts], dim=2).reshape(packed.shape[0], -1)
+            val = self.residual_value.float() / self.residual_scale[:, None]
+            dense = torch.zeros(val.shape[0], val.shape[1], self.residual_group, device=w.device)
+            valid = min(val.shape[1], idx.shape[1])
+            dense.scatter_(2, idx[:, :valid, None].long(), val[:, :valid, None])
+            res = dense.reshape(val.shape[0], -1)
+            w[:, self.salient_cols.long()] += res.t()
+        return w.to(dtype=dtype)
+
+    def forward(self, x):
+        return F.linear(x, self.effective_weight(x.dtype), self.bias)
+
+class TernaryLinear(nn.Module):
+    def __init__(self, in_features, out_features, group_size=128, bias=False, rank=0, device="cpu"):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.group_size = int(group_size)
+        self.groups = math.ceil(self.in_features / self.group_size)
+        self.register_buffer("codes", torch.zeros(self.out_features, self.groups, self.group_size, device=device, dtype=torch.int8))
+        self.scales = nn.Parameter(torch.ones(self.out_features, self.groups, device=device, dtype=torch.float32))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.out_features, device=device, dtype=torch.float32))
+        else:
+            self.register_parameter("bias", None)
+        self.rank = int(rank)
+        if self.rank:
+            self.lora_A = nn.Parameter(torch.zeros(self.rank, self.in_features, device=device, dtype=torch.float32))
+            self.lora_B = nn.Parameter(torch.zeros(self.out_features, self.rank, device=device, dtype=torch.float32))
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+
+    def effective_weight(self, dtype=torch.float32):
+        c = self.codes.float() * self.scales.clamp_min(1e-8).unsqueeze(-1)
+        w = c.flatten(1)[:, :self.in_features]
+        if self.lora_A is not None and self.lora_B is not None:
+            w = w + self.lora_B @ self.lora_A
+        return w.to(dtype=dtype)
+
+    def forward(self, x):
+        return F.linear(x, self.effective_weight(x.dtype), self.bias)
+''',
+        encoding="utf-8",
+    )
+
+    # Write manifest and provenance locks
+    manifest = {
+        "format": "qtea-v1",
+        "mode": mode,
+        "run_tag": run_tag,
+        "encoded": encoded_manifest,
+        "preserved": preserved_manifest,
+        "metrics": conversion_result,
+        "provenance": provenance or {},
+    }
+    (package_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (package_dir / "provenance_lock.json").write_text(
+        json.dumps(
+            {
+                "run_tag": run_tag,
+                "delta_ce": delta_ce,
+                "ce_max_regression": ce_max_regression,
+                "completed_count": len(completed_targets),
+                "provenance": provenance or {},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # Tarball archive
+    tar_path = Path(run_dir) / f"{run_tag}_package.tar.gz"
+    cmd = ["tar", "-czf", str(tar_path), "-C", str(package_dir), "."]
+    subprocess.run(cmd, check=True)
+
+    return package_dir, manifest
+
+
 __all__ = [
     "ExportManifest",
     "write_bf16_reference_artifact",
@@ -847,4 +1091,5 @@ __all__ = [
     "load_effective_ternary",
     "pack_ptq1_0",
     "_assert_not_source_fp",
+    "export_qtea_package",
 ]

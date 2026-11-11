@@ -859,6 +859,66 @@ def gate_summary(results: dict[str, GateResult]) -> dict[str, Any]:
     }
 
 
+def gate_ce_quality(
+    teacher_ce: float, student_ce: float, max_regression: float = 0.50
+) -> float:
+    """Enforce cross-entropy degradation threshold.
+
+    Raises:
+        QualityGateError: if (student_ce - teacher_ce) > max_regression.
+    """
+    from .errors import QualityGateError
+
+    delta_ce = float(student_ce - teacher_ce)
+    if delta_ce > max_regression:
+        raise QualityGateError(
+            f"Quality gate breach: CE degradation {delta_ce:.4f} > threshold {max_regression:.4f}"
+        )
+    return delta_ce
+
+
+def gate_logits_parity(
+    ref_logits: Any, reload_logits: Any, tolerance: float = 1e-2
+) -> float:
+    """Assert logits parity between reference and reloaded model on fixed test tokens.
+
+    Raises:
+        QualityGateError: if max absolute discrepancy > tolerance.
+    """
+    from .errors import QualityGateError
+
+    if hasattr(ref_logits, "detach"):
+        diff = (ref_logits.detach().float() - reload_logits.detach().float()).abs()
+        max_diff = float(diff.max().item())
+    else:
+        diff = np.abs(np.asarray(ref_logits, dtype=np.float32) - np.asarray(reload_logits, dtype=np.float32))
+        max_diff = float(np.max(diff))
+
+    if max_diff > tolerance:
+        raise QualityGateError(
+            f"Logits parity breach: max discrepancy {max_diff:.6e} > tolerance {tolerance:.6e}"
+        )
+    return max_diff
+
+
+def gate_top1_parity(ref_logits: Any, reload_logits: Any) -> bool:
+    """Verify top-1 token prediction identity across all positions."""
+    from .errors import QualityGateError
+
+    if hasattr(ref_logits, "argmax"):
+        ref_tokens = ref_logits.detach().argmax(dim=-1)
+        reload_tokens = reload_logits.detach().argmax(dim=-1)
+        match = bool(torch.equal(ref_tokens, reload_tokens))
+    else:
+        ref_tokens = np.asarray(ref_logits).argmax(axis=-1)
+        reload_tokens = np.asarray(reload_logits).argmax(axis=-1)
+        match = bool(np.array_equal(ref_tokens, reload_tokens))
+
+    if not match:
+        raise QualityGateError("Top-1 token prediction mismatch between reference and reload")
+    return True
+
+
 __all__ = [
     "GateResult",
     "gate_a_serialization_fidelity",
@@ -869,4 +929,7 @@ __all__ = [
     "gate_f_deployment_parity",
     "run_all_gates",
     "gate_summary",
+    "gate_ce_quality",
+    "gate_logits_parity",
+    "gate_top1_parity",
 ]
