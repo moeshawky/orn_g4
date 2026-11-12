@@ -44,6 +44,12 @@ def _get_fp8_max() -> float:
     return 448.0  # IEEE 754 float8_e4m3fn max finite value
 
 
+def _torch_no_grad(fn: Any) -> Any:
+    if _TORCH_AVAILABLE and torch is not None:
+        return torch.no_grad()(fn)
+    return fn
+
+
 FP8_MAX = _get_fp8_max()
 
 _POWERS_LIST = [1, 3, 9, 27, 81]
@@ -163,7 +169,7 @@ class QTEA:
                 f"{self.rows} rows is not a multiple of residual group {self.config.residual_group}"
             )
 
-    @torch.no_grad()
+    @_torch_no_grad
     def add_batch(self, inp: torch.Tensor) -> None:
         """Fold one calibration batch into the running Hessian H = 2/N * sum X X^T."""
         sequences = inp.shape[0] if inp.dim() == 3 else 1
@@ -291,7 +297,7 @@ class QTEA:
             scale,
         )
 
-    @torch.no_grad()
+    @_torch_no_grad
     def quantize(self, *, mutate_source: bool = False) -> Dict[str, Any]:
         """Run the QTEA sweep and return the packed payload.
 
@@ -741,6 +747,33 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
         else:
             self.register_parameter("bias", None)
 
+    def _load_from_state_dict(
+        self,
+        state_dict: Any,
+        prefix: str,
+        local_metadata: Any,
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        for bname in ("salient_cols", "residual_index", "residual_value", "residual_scale"):
+            key = prefix + bname
+            if key in state_dict:
+                src = state_dict[key]
+                buf = getattr(self, bname)
+                if buf.shape != src.shape or buf.dtype != src.dtype:
+                    setattr(self, bname, torch.empty_like(src, device=buf.device))
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     @classmethod
     def from_payload(
         cls,
@@ -809,10 +842,11 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
             "residual_scale": self.residual_scale,
         }
 
-    def effective_weight(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    def effective_weight(self, dtype: Optional[Any] = None) -> torch.Tensor:
         """Reconstruct dense weight tensor W = alpha * col_v * T + beta + residual."""
+        target_dtype = dtype if dtype is not None else (torch.float32 if torch is not None else None)
         w = unpack_layer(self.to_layer_dict())
-        return w.to(dtype=dtype)
+        return w.to(dtype=target_dtype) if target_dtype is not None else w
 
     @property
     def weight(self) -> torch.Tensor:

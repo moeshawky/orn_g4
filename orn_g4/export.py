@@ -283,10 +283,50 @@ def _read_tensors(path):
 
 
 def load_package(package_dir=None):
-    """Load an exported package: manifest, quantized projections, preserved tensors."""
+    """Load an exported package (qtea-v1 or qtea-sharded-v2): manifest, quantized projections, preserved tensors."""
     root = Path(package_dir).resolve() if package_dir else _HERE
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     runtime = _load_runtime()
+
+    if (root / "qtea-sharded-manifest.json").exists():
+        sharded_meta = json.loads((root / "qtea-sharded-manifest.json").read_text(encoding="utf-8"))
+        manifest = json.loads((root / "source-manifest.json").read_text(encoding="utf-8"))
+        all_tensors = {}
+        for shard in sharded_meta.get("shards", []):
+            all_tensors.update(_read_tensors(root / shard["file"]))
+        encoded_map = manifest.get("encoded") or {}
+        projections = {}
+        proj_prefixes = set()
+        for name, entry in encoded_map.items():
+            prefix = f"{name}."
+            proj_prefixes.add(prefix)
+            tensors = {
+                k[len(prefix):]: v
+                for k, v in all_tensors.items()
+                if k.startswith(prefix)
+            }
+            module = runtime.QTEALinear(
+                in_features=int(entry["cols"]),
+                out_features=int(entry["rows"]),
+                group_size=int(entry["group_size"]),
+                residual_group=int(entry["residual_group"]),
+                bias=bool(entry.get("has_bias")),
+            )
+            module.load_state_dict(tensors, strict=False)
+            projections[name] = module
+        preserved = {
+            k: v
+            for k, v in all_tensors.items()
+            if not any(k.startswith(p) for p in proj_prefixes)
+        }
+        return {
+            "manifest": manifest,
+            "sharded_manifest": sharded_meta,
+            "projections": projections,
+            "preserved_tensors": preserved,
+            "runtime": runtime,
+        }
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
 
     projections = {}
     for name, entry in (manifest.get("encoded") or {}).items():

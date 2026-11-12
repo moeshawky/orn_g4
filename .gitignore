@@ -11,3 +11,4 @@ venv/
 .env
 *.safetensors
 *.incomplete
+*.zip

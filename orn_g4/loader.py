@@ -492,7 +492,7 @@ def _to_numpy(value: Any) -> np.ndarray:
 
 def materialize_dense_checkpoint(
     path: Path | str,
-    dtype: torch.dtype | str = torch.bfloat16,
+    dtype: Any = "bfloat16",
     output_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Materialize the effective post-recovery model as ordinary dense tensors.

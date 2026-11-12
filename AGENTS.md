@@ -15,22 +15,24 @@ VIOLATE ANY → the failure surfaces later, in someone else's session, as a sile
 
 ## What this is
 
-25 modules under `orn_g4/` (~10.2k LOC) + `tests/`. A library only — no CLI, no `__main__`, no notebooks: 22 lines in the package reference `cell_00..cell_13`, but 0 files named `cell_*` are tracked here (they live in the Azrael-g4 Colab project). Docstrings cite an external "work-order §N" spec that is not in this repo — the code is the only source of truth for what was built. Every claim below was probed at commit `61ab3ac` (the code state; the doc refresh that follows it changes no code).
+26 modules under `orn_g4/` (~11.5k LOC) + `tests/` + `tools/`. A library with focused CLI utilities in `tools/` — no notebooks tracked in-tree (they live in the Azrael Colab projects). Every claim below was probed against running code and verified with the test suite.
 
 ## Ramp-up read order
 
 Cheapest first; stop as soon as you have what you need.
 
-1. `orn_g4/__init__.py` — module map + artifact taxonomy (A–D).
+1. `orn_g4/__init__.py` — module map + artifact taxonomy (A–D) + QTEA toolchain.
 2. `orn_g4/config.py` — `RunConfig`, `RunDirectoryLayout`, source handles, frozen release figures.
 3. `orn_g4/controller.py` — the 11-stage resumable graph.
-4. The module you are changing.
-5. `tests/test_<module>.py` — the executable spec for that module.
+4. `orn_g4/qtea_hf.py` / `tools/qtea_hf.py` — QTEA Hugging Face audit, lossless packing, verification, publishing, and full-model loading.
+5. The module you are changing.
+6. `tests/test_<module>.py` — the executable spec for that module.
 
 ## Commands
 
 ```bash
-python -m pytest tests/ -q                          # 75 passed at 61ab3ac, ~6s warm, CPU-only, no network
+python -m pytest tests/ -q                          # 144 passed, 2 skipped; CPU-only, no network
+python -m pytest tests/test_qtea_hf.py -q           # 10 QTEA HF integration tests
 python -m pytest tests/test_data.py -q              # one module
 python -m pytest tests/test_data.py::test_name -q   # one test
 ```
@@ -83,6 +85,9 @@ Non-obvious ownership only; the rest is self-describing.
 | `orn_g4/loader.py` | `save_canonical`/`load_canonical`, `module_replace`, trainable checkpoints, RoPE buffer restore |
 | `orn_g4/ternary_core.py` | the math, numpy-first so it is unit-testable CPU-only |
 | `orn_g4/recovery.py` | scale distillation, low-rank residual, selective QAT |
+| `orn_g4/qtea.py` | core QTEA mathematics, dead-zone search, iterative ternary fitting (ITF), `QTEALinear` module |
+| `orn_g4/qtea_hf.py` | first-party Hugging Face QTEA pipeline: remote audit, lossless shard packing, verification, staging branch publish, complete-model meta-skeleton instantiation with tied weights |
+| `tools/qtea_hf.py` | operational CLI for QTEA: `audit`, `pack`, `verify`, `publish`, `benchmark` |
 | `orn_g4/frozen_release.py` | read-only verification of the seven frozen MVP shards against the SHA-256 sidecars that ship with the release; **no in-package caller** — the notebook drives it |
 | `orn_g4/source_contract.py` | fail-closed Hub source pinning (`resolve_hub_sha`, `enforce_source_lock`), manifest-driven release validation, chat-template alignment; **no in-package caller** — the notebook drives it |
 | `orn_g4/gates.py`, `orn_g4/evaluation.py`, `orn_g4/reporting.py` | verification gates A–F; offline eval; report labelled `UNVERIFIED-IN-THIS-ENVIRONMENT` |
@@ -101,6 +106,36 @@ Non-obvious ownership only; the rest is self-describing.
 8. **Undeclared runtime deps.** `kagglehub` and `peft` are imported by the code but absent from `pyproject.toml` dependencies — `pip install -e .` will not bring them in. `peft` is only needed by `lora.setup_peft_lora`. (`huggingface_hub` *is* declared, as `>=0.28.0`.)
 9. **`transformers` may not import.** Probe `python -c "import transformers"` before relying on `modeling.discover_architecture`, `load_foundation_model`, `load_processor_and_tokenizer`, or `orn_g4/template.py`. At `61ab3ac` it still fails: `huggingface-hub>=1.5.0,<2.0` required, found `2.4.0`. numpy/torch paths are unaffected. The declared floor is `transformers>=5.8.1` and the installed version is `5.16.1`, so the floor is satisfied — the break is the *upper* bound on `huggingface_hub`, and because `pyproject.toml` declares `huggingface_hub>=0.28.0` with no ceiling, `pip install -e .` will **not** repair it. Fixing it means pinning `huggingface_hub<2.0` in the environment, not editing the floor.
 10. **The two preflight modules are notebook-facing, not wired in.** `frozen_release` and `source_contract` have no caller anywhere inside `orn_g4/` — only their own tests import them. They are consumed by the Azrael-g4 notebook (PR #1), which is not tracked in this repo, so "the notebook calls it" is an inference from the PR description and not a fact you can verify here. The same is true of the new `revision` / `allow_drive_fallback` arguments: `controller.py` never calls `build_layout`, `locate_dataset`, `import_model`, or `load_foundation_model`.
+11. **QTEA dynamic buffer shapes:** `QTEALinear` registers placeholder `(0,)` / `(0, 0)` buffers for `salient_cols`, `residual_index`, `residual_value`, and `residual_scale` because the salient column count `k` varies per projection. `QTEALinear._load_from_state_dict` resizes those four dynamic buffers before delegating to `nn.Module._load_from_state_dict`, while `load_qtea_full_model` strictly enforces fixed-geometry shapes (`ternary`, `col_v`, `group_alpha`, `group_beta`, `bias`) and cross-checks dynamic residual shapes against `salient_cols.numel()`.
+12. **Stale BF16 asset hazard:** Original uncompressed model assets include `model.safetensors.index.json` and `model-*.safetensors`. In the sharded QTEA distribution (`qtea-sharded-v2`), these stale files are purged from `assets/` to prevent Hugging Face loaders from attempting to resolve dense BF16 shards.
+13. **Main branch protection:** `moeshawky/Azrael-QTEA-9B@main` is immutable and quality-locked. Programmatic publish tools refuse to target `main` or the source revision. Target branch is `qtea-sharded-v2`.
+
+## QTEA Hugging Face Toolchain & Pipeline
+
+Maintained first-party pipeline (`orn_g4/qtea_hf.py` and `tools/qtea_hf.py`) replacing fragmented prototype scripts and legacy Google Drive dependencies.
+
+### Hardware Requirements
+- **Packing, Audit, Verification**: CPU-sufficient. Operates cleanly with 2–4 GiB system RAM and ~15–20 GiB temporary disk space for local shard staging.
+- **Full-Model Inference**: Requires NVIDIA CUDA GPU with $\ge 24\text{ GiB}$ VRAM (e.g. RTX 3090/4090, A5000, A100). The current reference forward pass materializes effective dense weights during execution; no packed-kernel speedup is claimed. Model retains provenance status `QUALITY_REJECTED_RECOVERY_REQUIRED` (+1.8708 CE degradation over teacher).
+
+### Operational CLI Commands
+
+```bash
+# 1. Remote read-only audit (inspects inventory, validates 248 projections, calculates download size without fetching weights)
+python tools/qtea_hf.py audit --repo moeshawky/Azrael-QTEA-9B
+
+# 2. Local lossless repacking into SafeTensors shards (preserves FP8 residuals and int dtypes bit-for-bit)
+python tools/qtea_hf.py pack --source /path/to/downloaded_qtea --output /path/to/sharded_out --shard-mib 2048
+
+# 3. Independent cryptographic verification of packed package
+python tools/qtea_hf.py verify --path /path/to/sharded_out
+
+# 4. Direct HF download, local repack, and upload to staging branch (fails closed if token is invalid or owner mismatches)
+python tools/qtea_hf.py publish --repo moeshawky/Azrael-QTEA-9B --branch qtea-sharded-v2 --workdir /tmp/qtea-work --token "$HF_TOKEN"
+
+# 5. Full-model reconstruction on meta device and GPU inference benchmark (records separated loading and inference peak VRAM)
+python tools/qtea_hf.py benchmark --model-path /path/to/sharded_out --device cuda --prompt "Explain the difference between synchronous and asynchronous consensus."
+```
 
 ## Data contract (`orn_g4/data.py`)
 
@@ -141,6 +176,9 @@ Non-obvious ownership only; the rest is self-describing.
 - Adding a lint/typecheck/CI config "to match other repos" — there is none here; pytest is the gate.
 - Training or calibrating on `eval_firewall/` — `resolve_shards` always excludes it.
 - Publishing a file path that does not exist in the repo — a broken reference fails silently.
+- Publishing to or modifying Hugging Face `main` branch on `moeshawky/Azrael-QTEA-9B` — `main` is protected; target `qtea-sharded-v2`.
+- Passing QTEA checkpoints through pure-ternary serializers or NumPy float conversions that destroy FP8 residuals.
+- Claiming packed-kernel acceleration or production-ready status for QTEA inference while evaluated at `QUALITY_REJECTED_RECOVERY_REQUIRED`.
 
 ---
 

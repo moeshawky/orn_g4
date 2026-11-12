@@ -79,6 +79,12 @@ from .errors import (
     PackageResolutionError,
     QualityGateError,
     QTEAError,
+    QTEABenchmarkError,
+    QTEALoadError,
+    QTEAPackError,
+    QTEAPublishError,
+    QTEASourceError,
+    QTEAVerifyError,
     RecoveryError,
     RotationError,
     SourceContractError,
@@ -96,6 +102,16 @@ from .qtea import (
     pack_ternary,
     unpack_layer,
     unpack_ternary,
+)
+from .qtea_hf import (
+    audit_remote_qtea,
+    benchmark_qtea_inference,
+    load_qtea_full_model,
+    pack_qtea_shards,
+    publish_qtea_sharded,
+    run_qtea_benchmark,
+    validate_qtea_source,
+    verify_qtea_shards,
 )
 from .export import (
     QTEA_OUTCOME_CONVERTED,
@@ -147,6 +163,12 @@ __all__ = [
     "SourceContractError",
     "QualityGateError",
     "QTEAError",
+    "QTEASourceError",
+    "QTEAPackError",
+    "QTEAVerifyError",
+    "QTEAPublishError",
+    "QTEALoadError",
+    "QTEABenchmarkError",
     # qtea
     "QTEA",
     "QTEAConfig",
@@ -158,6 +180,15 @@ __all__ = [
     "pack_ternary",
     "unpack_layer",
     "unpack_ternary",
+    # qtea hf tooling
+    "audit_remote_qtea",
+    "validate_qtea_source",
+    "pack_qtea_shards",
+    "verify_qtea_shards",
+    "publish_qtea_sharded",
+    "load_qtea_full_model",
+    "benchmark_qtea_inference",
+    "run_qtea_benchmark",
     # qtea export
     "export_qtea_package",
     "verify_qtea_package",

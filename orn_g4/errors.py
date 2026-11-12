@@ -114,10 +114,60 @@ class QualityGateError(OrnG4Error):
 
 
 class QTEAError(OrnG4Error):
-    """QTEA quantization, calibration, or packing failed.
+    """QTEA quantization, calibration, packing, or tooling failed.
 
-    # Errors: raised by :class:`orn_g4.qtea.QTEA` or :func:`orn_g4.qtea.pack_layer`
-    when dimensions are invalid or quantization diverges.
+    # Errors: raised by :class:`orn_g4.qtea.QTEA`, :func:`orn_g4.qtea.pack_layer`,
+    or QTEA Hugging Face tooling when dimensions are invalid, serialization
+    diverges, source verification fails, or loading fails.
+    """
+
+
+class QTEASourceError(QTEAError):
+    """QTEA source validation or remote repository auditing failed.
+
+    # Errors: raised when required QTEA artifacts or manifests are missing,
+    corrupted, or mismatched on the Hub or local disk.
+    """
+
+
+class QTEAPackError(QTEAError):
+    """QTEA sharded repackaging or tensor preservation verification failed.
+
+    # Errors: raised when repacking cannot complete losslessly, tensor hashes
+    diverge, or output directories conflict.
+    """
+
+
+class QTEAVerifyError(QTEAError):
+    """QTEA sharded package verification failed.
+
+    # Errors: raised when sharded files, manifests, or tensor indices fail
+    integrity checks.
+    """
+
+
+class QTEAPublishError(QTEAError):
+    """QTEA staged publishing or remote verification failed.
+
+    # Errors: raised when publishing permissions are missing, safety checks
+    fail, or the remote staging branch fails post-upload verification.
+    """
+
+
+class QTEALoadError(QTEAError):
+    """Complete Ornith QTEA model loading failed.
+
+    # Errors: raised when architecture skeleton instantiation, module
+    replacement, tensor assignment, tied alias restoration, or rotary buffer
+    reconstruction fails.
+    """
+
+
+class QTEABenchmarkError(QTEAError):
+    """QTEA inference benchmark execution failed.
+
+    # Errors: raised when forward pass, logit verification, or generation
+    fails.
     """
 
 
@@ -186,9 +236,17 @@ __all__ = [
     "TernaryError",
     "RotationError",
     "RecoveryError",
+    "QualityGateError",
     "ExportError",
     "ControllerError",
     "BudgetExceededError",
     "ChecksumMismatchError",
     "SourceContractError",
+    "QTEAError",
+    "QTEASourceError",
+    "QTEAPackError",
+    "QTEAVerifyError",
+    "QTEAPublishError",
+    "QTEALoadError",
+    "QTEABenchmarkError",
 ]
