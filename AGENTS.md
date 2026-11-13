@@ -84,8 +84,10 @@ Non-obvious ownership only; the rest is self-describing.
 | `orn_g4/export.py` | artifacts A–D (PEFT adapter, canonical ternary, trainable continuation, dense/GGUF) |
 | `orn_g4/loader.py` | `save_canonical`/`load_canonical`, `module_replace`, trainable checkpoints, RoPE buffer restore |
 | `orn_g4/ternary_core.py` | the math, numpy-first so it is unit-testable CPU-only |
-| `orn_g4/recovery.py` | scale distillation, low-rank residual, selective QAT |
-| `orn_g4/qtea.py` | core QTEA mathematics, dead-zone search, iterative ternary fitting (ITF), `QTEALinear` module |
+| `orn_g4/recovery.py` | scale distillation, low-rank residual, selective QAT, teacher-guided mixed-precision recovery (`train_mixed_precision_recovery`) |
+| `orn_g4/qtea.py` | core QTEA mathematics, dead-zone search, iterative ternary fitting (ITF), `QTEALinear`, mixed-precision policy (`PROJECTION_PRECISION_POLICY`, `discover_mixed_precision_targets`, `convert_model_mixed_precision`) |
+| `orn_g4/quant4.py` | protected 4-bit affine codec (`Protected4BitLinear`, `affine_uint4`) with optional rank-16 recovery adapters |
+| `orn_g4/fallback.py` | independent Q4 fallback (`build_q4_fallback_model`, `export_q4_fallback_package`, `load_q4_fallback_package`) directly from BF16 teacher |
 | `orn_g4/qtea_hf.py` | first-party Hugging Face QTEA pipeline: remote audit, lossless shard packing, verification, staging branch publish, complete-model meta-skeleton instantiation with tied weights |
 | `tools/qtea_hf.py` | operational CLI for QTEA: `audit`, `pack`, `verify`, `publish`, `benchmark` |
 | `orn_g4/frozen_release.py` | read-only verification of the seven frozen MVP shards against the SHA-256 sidecars that ship with the release; **no in-package caller** — the notebook drives it |

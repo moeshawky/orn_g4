@@ -2,7 +2,7 @@
 
 > **Deterministic 1.58-bit ternary quantization, low-rank recovery, and canonical safetensors serialization for Ornith-1.5-9B and Qwen3.5 architectures.**
 
-[![Tests](https://img.shields.io/badge/tests-144%20passed%2C%202%20skipped-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-150%20passed%2C%202%20skipped-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue.svg)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)]()
 [![Framework](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)]()

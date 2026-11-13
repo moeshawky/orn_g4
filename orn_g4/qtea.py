@@ -17,8 +17,9 @@ Core mathematical components:
 
 from __future__ import annotations
 
+import copy
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -608,7 +609,7 @@ def residual_columns(layer: Dict[str, Any]) -> torch.Tensor:
     if residual_value.numel() == 0:
         return torch.zeros(0, layer["rows"], device=residual_value.device)
 
-    packed = layer["residual_index"].int()
+    packed = layer["residual_index"].to(residual_value.device).int()
     shifts = [0, 2, 4, 6]
     index = torch.stack([(packed >> s) & 0x3 for s in shifts], dim=2).reshape(
         packed.shape[0], -1
@@ -652,14 +653,15 @@ def unpack_layer(layer: Dict[str, Any]) -> torch.Tensor:
     else:
         codes = layer["ternary"].float()
 
-    alpha = layer["group_alpha"].repeat_interleave(layer["group_size"], dim=1)
-    beta = layer["group_beta"].repeat_interleave(layer["group_size"], dim=1)
-    col_v = layer["col_v"]
+    alpha = layer["group_alpha"].to(device).repeat_interleave(layer["group_size"], dim=1)
+    beta = layer["group_beta"].to(device).repeat_interleave(layer["group_size"], dim=1)
+    col_v = layer["col_v"].to(device)
 
-    weight = alpha * col_v.to(device)[None, :] * codes.to(device) + beta.to(device)
+    weight = alpha * col_v[None, :] * codes.to(device) + beta
     salient = layer["salient_cols"].to(device).long()
     if salient.numel() > 0 and layer["residual_value"].numel() > 0:
-        weight[:, salient] += residual_columns(layer).to(device).t()
+        res_t = residual_columns(layer).to(device=device, dtype=weight.dtype).t()
+        weight = weight.index_add(1, salient, res_t)
     return weight
 
 
@@ -739,6 +741,10 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
         self.register_buffer(
             "residual_scale", torch.zeros(0, dtype=torch.float32, device=device)
         )
+        self.lora_rank: int = 0
+        self.lora_alpha: float = 0.0
+        self.register_parameter("lora_A", None)
+        self.register_parameter("lora_B", None)
 
         if bias:
             self.bias = nn.Parameter(
@@ -746,6 +752,49 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
             )
         else:
             self.register_parameter("bias", None)
+
+    def enable_recovery_parameters(
+        self,
+        *,
+        train_scales: bool = True,
+        lora_rank: int = 0,
+        lora_alpha: float = 32.0,
+    ) -> None:
+        """Promote continuous QTEA parameters for differentiable recovery.
+
+        Keeps discrete ``ternary``, ``salient_cols``, ``residual_index``,
+        ``residual_value``, and ``residual_scale`` frozen as buffers.
+
+        # Errors: raises QTEAError if ``lora_rank < 0``.
+        """
+        if lora_rank < 0:
+            raise QTEAError(f"lora_rank must be non-negative, got {lora_rank}")
+        dev = self.ternary.device
+        if train_scales:
+            for pname in ("group_alpha", "group_beta", "col_v"):
+                if pname in self._buffers:
+                    buf = self._buffers.pop(pname)
+                    self.register_parameter(
+                        pname,
+                        nn.Parameter(
+                            buf.detach().clone().to(device=dev, dtype=torch.float32),
+                            requires_grad=True,
+                        ),
+                    )
+                elif pname in self._parameters and self._parameters[pname] is not None:
+                    self._parameters[pname].requires_grad_(True)
+        if lora_rank > 0:
+            self.lora_rank = int(lora_rank)
+            self.lora_alpha = float(lora_alpha)
+            lora_a = torch.empty(
+                self.lora_rank, self.in_features, dtype=torch.float32, device=dev
+            )
+            nn.init.kaiming_uniform_(lora_a, a=math.sqrt(5))
+            lora_b = torch.zeros(
+                self.out_features, self.lora_rank, dtype=torch.float32, device=dev
+            )
+            self.lora_A = nn.Parameter(lora_a, requires_grad=True)
+            self.lora_B = nn.Parameter(lora_b, requires_grad=True)
 
     def _load_from_state_dict(
         self,
@@ -764,6 +813,17 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
                 buf = getattr(self, bname)
                 if buf.shape != src.shape or buf.dtype != src.dtype:
                     setattr(self, bname, torch.empty_like(src, device=buf.device))
+        if (prefix + "lora_A") in state_dict and (prefix + "lora_B") in state_dict:
+            src_a = state_dict[prefix + "lora_A"]
+            src_b = state_dict[prefix + "lora_B"]
+            dev = self.ternary.device
+            if self.lora_A is None or tuple(self.lora_A.shape) != tuple(src_a.shape):
+                self.lora_A = nn.Parameter(torch.empty_like(src_a, device=dev), requires_grad=False)
+            if self.lora_B is None or tuple(self.lora_B.shape) != tuple(src_b.shape):
+                self.lora_B = nn.Parameter(torch.empty_like(src_b, device=dev), requires_grad=False)
+            self.lora_rank = int(src_a.shape[0])
+            if self.lora_alpha == 0.0:
+                self.lora_alpha = float(self.lora_rank * 2)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -843,9 +903,12 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
         }
 
     def effective_weight(self, dtype: Optional[Any] = None) -> torch.Tensor:
-        """Reconstruct dense weight tensor W = alpha * col_v * T + beta + residual."""
+        """Reconstruct dense weight tensor W = alpha * col_v * T + beta + residual + optional LoRA."""
         target_dtype = dtype if dtype is not None else (torch.float32 if torch is not None else None)
         w = unpack_layer(self.to_layer_dict())
+        if self.lora_A is not None and self.lora_B is not None and self.lora_rank > 0:
+            scaling = float(self.lora_alpha) / float(self.lora_rank)
+            w = w + (self.lora_B.to(w.dtype) @ self.lora_A.to(w.dtype)) * scaling
         return w.to(dtype=target_dtype) if target_dtype is not None else w
 
     @property
@@ -863,10 +926,285 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
 # ==============================================================================
 
 ORNITH_TARGET_FAMILIES = {
-    "linear_attn": ("in_proj_qkv", "in_proj_z", "in_proj_b", "out_proj"),
+    "linear_attn": ("in_proj_qkv", "in_proj_a", "in_proj_z", "in_proj_b", "out_proj"),
     "self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
     "mlp": ("gate_proj", "up_proj", "down_proj"),
 }
+
+#: Authoritative mixed-precision projection registry for Ornith-1.5-9B:
+#: 24 linear_attn + 8 self_attn + 32 mlp = 144 QTEA + 104 4-bit = 248 total.
+PROJECTION_PRECISION_POLICY: Dict[Tuple[str, str], str] = {
+    ("mlp", "gate_proj"): "qtea",
+    ("mlp", "up_proj"): "qtea",
+    ("mlp", "down_proj"): "int4",
+    ("self_attn", "q_proj"): "qtea",
+    ("self_attn", "k_proj"): "qtea",
+    ("self_attn", "v_proj"): "qtea",
+    ("self_attn", "o_proj"): "qtea",
+    ("linear_attn", "in_proj_qkv"): "qtea",
+    ("linear_attn", "out_proj"): "qtea",
+    ("linear_attn", "in_proj_a"): "int4",
+    ("linear_attn", "in_proj_b"): "int4",
+    ("linear_attn", "in_proj_z"): "int4",
+}
+
+_EXCLUDED_MODULE_PREFIXES = (
+    "visual",
+    "vision_tower",
+    "vision_encoder",
+    "embed_tokens",
+    "embed_positions",
+    "lm_head",
+    "output_embeddings",
+    "mtp",
+)
+
+
+@dataclass(frozen=True)
+class ProjectionTarget:
+    """Validated projection target and its assigned mixed-precision representation."""
+
+    name: str
+    layer_index: int
+    family: str
+    leaf: str
+    precision: str  # "qtea" | "int4"
+    in_features: int
+    out_features: int
+    has_bias: bool
+    module: Any = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class MixedPrecisionPlan:
+    """Validated mixed-precision conversion plan across Ornith language layers."""
+
+    targets: Tuple[ProjectionTarget, ...]
+    qtea_targets: Tuple[ProjectionTarget, ...]
+    int4_targets: Tuple[ProjectionTarget, ...]
+    excluded_modules: Tuple[str, ...]
+    layer_count: int
+    linear_attn_layers: int
+    self_attn_layers: int
+    mlp_layers: int
+    assignments: Dict[str, str]
+    prefix: str = ""
+
+
+def _resolve_layers_root(model: Any) -> Tuple[str, Any]:
+    """Return ``(prefix, layers_module_list)`` for Ornith / Qwen3.5 / synthetic models."""
+    if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        return "language_model.", model.language_model.layers
+    if hasattr(model, "model") and hasattr(model.model, "language_model") and hasattr(model.model.language_model, "layers"):
+        return "model.language_model.", model.model.language_model.layers
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return "model.", model.model.layers
+    if hasattr(model, "layers"):
+        return "", model.layers
+    raise QTEAError("Could not locate transformer language_model.layers on model")
+
+
+def discover_mixed_precision_targets(
+    model: Any,
+    *,
+    expected_qtea: int = 144,
+    expected_int4: int = 104,
+    expected_total: int = 248,
+    strict: bool = True,
+) -> MixedPrecisionPlan:
+    """Discover and validate mixed-precision projection targets for Ornith-1.5-9B.
+
+    Applies :data:`PROJECTION_PRECISION_POLICY`, excludes vision/embeddings/norms/
+    output-head/MTP modules, validates every target's ``nn.Linear`` type and
+    2D weight geometry, and fails closed when architecture or counts mismatch.
+
+    # Errors: raises QTEAError when PyTorch is unavailable, layers are missing,
+    an unexpected linear projection appears inside ``linear_attn``/``self_attn``/
+    ``mlp``, or the discovered counts do not match ``(expected_qtea, expected_int4)``
+    when ``strict=True``.
+    """
+    if not _TORCH_AVAILABLE:
+        raise QTEAError("PyTorch is required for mixed-precision target discovery")
+
+    prefix, layers = _resolve_layers_root(model)
+    targets: List[ProjectionTarget] = []
+    excluded: List[str] = []
+    linear_attn_layers = 0
+    self_attn_layers = 0
+    mlp_layers = 0
+
+    for top_name, _ in model.named_modules():
+        if not top_name:
+            continue
+        if any(
+            top_name == ex or top_name.startswith(f"{ex}.") or f".{ex}." in top_name or top_name.endswith(f".{ex}")
+            for ex in _EXCLUDED_MODULE_PREFIXES
+        ) or "norm" in top_name.lower():
+            excluded.append(top_name)
+
+    for layer_idx, layer in enumerate(layers):
+        has_lin = hasattr(layer, "linear_attn")
+        has_self = hasattr(layer, "self_attn")
+        has_mlp = hasattr(layer, "mlp")
+        if has_lin:
+            linear_attn_layers += 1
+        if has_self:
+            self_attn_layers += 1
+        if has_mlp:
+            mlp_layers += 1
+
+        for sub_name, module in layer.named_modules():
+            if not sub_name or not isinstance(module, nn.Linear):
+                continue
+            parts = sub_name.split(".")
+            if len(parts) < 2:
+                continue
+            family = parts[0]
+            leaf = parts[-1]
+            if family not in ORNITH_TARGET_FAMILIES:
+                continue
+
+            full_name = f"{prefix}layers.{layer_idx}.{sub_name}"
+            policy_key = (family, leaf)
+            if policy_key not in PROJECTION_PRECISION_POLICY:
+                if strict:
+                    raise QTEAError(
+                        f"Unexpected projection {full_name!r} (family={family!r}, leaf={leaf!r}) "
+                        f"not in PROJECTION_PRECISION_POLICY"
+                    )
+                continue
+
+            if module.weight.ndim != 2 or module.in_features <= 0 or module.out_features <= 0:
+                raise QTEAError(
+                    f"Invalid nn.Linear geometry at {full_name!r}: shape={tuple(module.weight.shape)}"
+                )
+
+            precision = PROJECTION_PRECISION_POLICY[policy_key]
+            targets.append(
+                ProjectionTarget(
+                    name=full_name,
+                    layer_index=layer_idx,
+                    family=family,
+                    leaf=leaf,
+                    precision=precision,
+                    in_features=int(module.in_features),
+                    out_features=int(module.out_features),
+                    has_bias=module.bias is not None,
+                    module=module,
+                )
+            )
+
+    qtea_targets = tuple(t for t in targets if t.precision == "qtea")
+    int4_targets = tuple(t for t in targets if t.precision == "int4")
+
+    if strict:
+        if len(qtea_targets) != expected_qtea or len(int4_targets) != expected_int4 or len(targets) != expected_total:
+            raise QTEAError(
+                f"Mixed-precision projection count mismatch: "
+                f"qtea={len(qtea_targets)} (expected {expected_qtea}), "
+                f"int4={len(int4_targets)} (expected {expected_int4}), "
+                f"total={len(targets)} (expected {expected_total})"
+            )
+
+    assignments = {t.name: t.precision for t in targets}
+    return MixedPrecisionPlan(
+        targets=tuple(targets),
+        qtea_targets=qtea_targets,
+        int4_targets=int4_targets,
+        excluded_modules=tuple(excluded),
+        layer_count=len(layers),
+        linear_attn_layers=linear_attn_layers,
+        self_attn_layers=self_attn_layers,
+        mlp_layers=mlp_layers,
+        assignments=assignments,
+        prefix=prefix,
+    )
+
+
+def _set_submodule_by_name(root: Any, dotted_name: str, new_module: Any) -> None:
+    parts = dotted_name.split(".")
+    parent = root
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    setattr(parent, parts[-1], new_module)
+
+
+def convert_model_mixed_precision(
+    model: Any,
+    calibration_batches_by_name: Optional[Dict[str, List[Any]]] = None,
+    *,
+    qtea_config: Optional[QTEAConfig] = None,
+    int4_group_size: int = 128,
+    plan: Optional[MixedPrecisionPlan] = None,
+    expected_qtea: int = 144,
+    expected_int4: int = 104,
+    expected_total: int = 248,
+    strict: bool = True,
+    inplace: bool = False,
+) -> Tuple[Any, Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], MixedPrecisionPlan]:
+    """Convert an Ornith model using the validated mixed-precision policy.
+
+    Never silently falls back to uncompressed BF16/FP32 weights for any target
+    in the plan.
+
+    # Errors: raises QTEAError on discovery mismatch or missing calibration
+    batches for QTEA projections (unless ``calibration_batches_by_name`` is
+    omitted, in which case identity Hessian calibration is used for synthetic
+    testing).
+    """
+    if not _TORCH_AVAILABLE:
+        raise QTEAError("PyTorch is required for convert_model_mixed_precision")
+    from .quant4 import Protected4BitLinear
+
+    work_model = model if inplace else copy.deepcopy(model)
+    resolved_plan = plan or discover_mixed_precision_targets(
+        work_model,
+        expected_qtea=expected_qtea,
+        expected_int4=expected_int4,
+        expected_total=expected_total,
+        strict=strict,
+    )
+
+    cfg = qtea_config or QTEAConfig()
+    qtea_packed: Dict[str, Dict[str, Any]] = {}
+    int4_packed: Dict[str, Dict[str, Any]] = {}
+    batches_map = calibration_batches_by_name or {}
+
+    for target in resolved_plan.targets:
+        # Resolve module on work_model (in case inplace=False deepcopied it)
+        parent = work_model
+        for p in target.name.split(".")[:-1]:
+            parent = getattr(parent, p)
+        src_mod = getattr(parent, target.name.split(".")[-1])
+        if not isinstance(src_mod, nn.Linear):
+            raise QTEAError(
+                f"Target {target.name!r} is {type(src_mod).__name__}, expected nn.Linear"
+            )
+
+        if target.precision == "qtea":
+            proj_batches = batches_map.get(target.name)
+            if not proj_batches:
+                # Deterministic identity activation sample when no activation cache is supplied
+                proj_batches = [
+                    torch.eye(src_mod.in_features, dtype=torch.float32, device=src_mod.weight.device)
+                ]
+            packed, q_mod = calibrate_and_quantize_projection(
+                target.name,
+                src_mod,
+                proj_batches,
+                config=cfg,
+                mutate_source=False,
+            )
+            qtea_packed[target.name] = packed
+            _set_submodule_by_name(work_model, target.name, q_mod)
+        elif target.precision == "int4":
+            q4_mod = Protected4BitLinear.from_linear(src_mod, group_size=int4_group_size)
+            int4_packed[target.name] = q4_mod.to_layer_dict()
+            _set_submodule_by_name(work_model, target.name, q4_mod)
+        else:
+            raise QTEAError(f"Unsupported precision assignment {target.precision!r} for {target.name!r}")
+
+    return work_model, qtea_packed, int4_packed, resolved_plan
 
 PILOT_TARGETS = [
     "layers.0.linear_attn.in_proj_qkv",

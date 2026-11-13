@@ -806,6 +806,181 @@ class FrozenDataset:
         return [next(it)[1] for _ in range(n)]
 
 
+def resolve_latest_dataset_revision(
+    repo_id: str = HF_DATASET_HANDLE,
+    revision: str | None = None,
+    *,
+    token: str | None = None,
+) -> str:
+    """Dynamically resolve the latest Hub commit SHA for a dataset repository.
+
+    Never hardcodes a dataset commit hash. When ``revision`` is provided,
+    resolves that ref/revision to its concrete commit SHA via Hub metadata
+    (or returns a 40-char hex SHA directly if offline/already pinned).
+
+    # Errors: raises DatasetError if Hub resolution fails.
+    """
+    clean_id = repo_id.removeprefix("hf://").strip()
+    if revision is not None and len(revision) == 40 and all(c in "0123456789abcdef" for c in revision.lower()):
+        return revision
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+        info = api.dataset_info(repo_id=clean_id, revision=revision)
+        sha = getattr(info, "sha", None)
+        if not sha:
+            raise DatasetError(f"Hub returned no commit SHA for dataset {clean_id!r}")
+        return str(sha)
+    except DatasetError:
+        raise
+    except Exception as exc:
+        raise DatasetError(
+            f"Failed to resolve latest dataset revision for {clean_id!r}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def select_stratified_calibration(
+    records: list[dict[str, Any]],
+    *,
+    target_count: int,
+    seed: int = 42,
+    require_validated_supervised: bool = True,
+) -> list[dict[str, Any]]:
+    """Deterministically select a source- and length-stratified calibration set.
+
+    Distinguishes validated supervised records (``supervised_count > 0`` and
+    ``is_raw_capture`` is False / ``validated`` is not False) from raw captures.
+
+    # Errors: raises DatasetError if ``target_count <= 0`` or no eligible
+    records remain after filtering.
+    """
+    if target_count <= 0:
+        raise DatasetError(f"target_count must be positive, got {target_count}")
+
+    eligible: list[dict[str, Any]] = []
+    for rec in records:
+        if require_validated_supervised:
+            if rec.get("is_raw_capture", False):
+                continue
+            if rec.get("validated") is False:
+                continue
+            sup = rec.get("supervised_count")
+            if sup is not None and int(sup) <= 0:
+                continue
+        eligible.append(rec)
+
+    if not eligible:
+        raise DatasetError("No eligible calibration records after supervised/validated filtering")
+
+    def _length_bucket(rec: dict[str, Any]) -> str:
+        n = int(rec.get("token_count", len(rec.get("input_ids", ()))))
+        if n <= 1024:
+            return "short"
+        if n <= 4096:
+            return "medium"
+        return "long"
+
+    strata: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for rec in eligible:
+        src = str(rec.get("source", "unknown"))
+        key = (src, _length_bucket(rec))
+        strata.setdefault(key, []).append(rec)
+
+    for key in strata:
+        strata[key].sort(
+            key=lambda r: hashlib.sha256(f"{seed}:{r.get('id', '')}:{key[0]}:{key[1]}".encode()).hexdigest()
+        )
+
+    selected: list[dict[str, Any]] = []
+    ordered_keys = sorted(strata.keys())
+    cursors = {k: 0 for k in ordered_keys}
+    while len(selected) < min(target_count, len(eligible)):
+        progressed = False
+        for k in ordered_keys:
+            idx = cursors[k]
+            if idx < len(strata[k]):
+                selected.append(strata[k][idx])
+                cursors[k] = idx + 1
+                progressed = True
+                if len(selected) >= target_count:
+                    break
+        if not progressed:
+            break
+    return selected
+
+
+def prepare_full_context_windows(
+    input_ids: list[int] | Any,
+    labels: list[int] | Any,
+    *,
+    max_seq_len: int = 8192,
+    window_size: int | None = None,
+    stride: int | None = None,
+) -> dict[str, Any]:
+    """Prepare 8,192-context sequences without silent 3,072 truncation.
+
+    When ``window_size`` is None or ``>= len(input_ids)``, returns the single
+    full sequence (capped only at ``max_seq_len=8192``). When a smaller
+    ``window_size`` is explicitly supplied for memory-bounded execution, splits
+    into overlapping windows and masks overlap prefix labels to ``-100`` so
+    no supervised token is double-counted.
+
+    # Errors: raises DataAlignmentError if ``len(input_ids) != len(labels)`` or
+    sequence exceeds ``max_seq_len``.
+    """
+    ids_list = list(input_ids)
+    lbl_list = list(labels)
+    if len(ids_list) != len(lbl_list):
+        raise DataAlignmentError(
+            f"input_ids length ({len(ids_list)}) != labels length ({len(lbl_list)})"
+        )
+    seq_len = len(ids_list)
+    if seq_len == 0 or seq_len > max_seq_len:
+        raise DataAlignmentError(
+            f"Sequence length {seq_len} outside supported [1, {max_seq_len}]"
+        )
+
+    win = seq_len if window_size is None else int(window_size)
+    if win <= 0:
+        raise DataAlignmentError(f"window_size must be positive, got {win}")
+
+    if seq_len <= win:
+        return {
+            "windows": [{"input_ids": ids_list, "labels": lbl_list, "start": 0, "end": seq_len}],
+            "windowed": False,
+            "effective_context_len": seq_len,
+            "max_seq_len": max_seq_len,
+        }
+
+    step = int(stride) if stride is not None else max(1, win // 2)
+    if step <= 0 or step > win:
+        raise DataAlignmentError(f"Invalid stride {step} for window_size {win}")
+
+    windows: list[dict[str, Any]] = []
+    start = 0
+    prev_end = 0
+    while start < seq_len:
+        end = min(seq_len, start + win)
+        w_ids = ids_list[start:end]
+        w_lbl = list(lbl_list[start:end])
+        overlap = max(0, prev_end - start)
+        for i in range(overlap):
+            w_lbl[i] = -100
+        windows.append({"input_ids": w_ids, "labels": w_lbl, "start": start, "end": end})
+        if end == seq_len:
+            break
+        prev_end = end
+        start = min(seq_len - win, start + step) if (start + step < seq_len) else seq_len
+
+    return {
+        "windows": windows,
+        "windowed": True,
+        "effective_context_len": win,
+        "max_seq_len": max_seq_len,
+    }
+
+
 __all__ = [
     "ShardRef",
     "DatasetLayout",
@@ -824,4 +999,7 @@ __all__ = [
     "build_layout",
     "load_shard",
     "validate_alignment",
+    "resolve_latest_dataset_revision",
+    "select_stratified_calibration",
+    "prepare_full_context_windows",
 ]

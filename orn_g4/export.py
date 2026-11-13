@@ -1854,6 +1854,416 @@ def _atomic_save_tensors(tensors: dict[str, Any], dest: Path) -> None:
     staged.replace(dest)
 
 
+MIXED_PRECISION_FORMAT = "azrael-mixed-precision-v1"
+
+
+def _tensor_bitwise_sha256(tensor: Any) -> str:
+    """Compute bitwise SHA-256 over raw tensor bytes without dtype conversion."""
+    import torch
+
+    if tensor.numel() == 0:
+        return hashlib.sha256(b"").hexdigest()
+    raw = tensor.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _copy_clean_assets(assets_dir: Path | str, dest_assets: Path) -> list[str]:
+    """Copy model assets while excluding stale BF16 shard indexes and weights."""
+    src = Path(assets_dir).resolve()
+    if not src.is_dir():
+        raise ExportError(f"assets_dir does not exist: {src}")
+    dest_assets.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for item in sorted(src.iterdir()):
+        if not item.is_file():
+            continue
+        if item.name == "model.safetensors.index.json" or (
+            item.name.startswith("model-") and item.name.endswith(".safetensors")
+        ):
+            continue
+        shutil.copy2(item, dest_assets / item.name)
+        copied.append(item.name)
+    return copied
+
+
+def export_mixed_precision_package(
+    model: Any,
+    output_dir: Path | str,
+    *,
+    plan: Any | None = None,
+    assets_dir: Path | str | None = None,
+    shard_max_bytes: int | None = None,
+    provenance: dict[str, Any] | None = None,
+    recovery_status: str = "recovered",
+    format_name: str = MIXED_PRECISION_FORMAT,
+) -> Path:
+    """Export a standalone mixed-precision (QTEA + Protected4Bit + preserved) package.
+
+    Preserves packed ternary codes, FP8 residuals, continuous QTEA scales,
+    4-bit affine weights, optional rank-16 LoRA adapters, tied weights, and
+    preserved tensors in SafeTensors format without BF16 teacher dependency.
+
+    # Errors: raises ExportError if PyTorch/safetensors are unavailable or
+    weight serialization fails.
+    """
+    try:
+        import torch
+        from safetensors.torch import save_file
+    except ImportError as exc:
+        raise ExportError("torch and safetensors are required for export_mixed_precision_package") from exc
+
+    from .quant4 import Protected4BitLinear
+    from .qtea import QTEALinear
+    from .utils import write_json_atomic
+
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    projection_meta: dict[str, dict[str, Any]] = {}
+    precision_assignments: dict[str, str] = {}
+    qtea_count = 0
+    int4_count = 0
+
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, QTEALinear):
+            qtea_count += 1
+            precision_assignments[mod_name] = "qtea"
+            projection_meta[mod_name] = {
+                "precision": "qtea",
+                "in_features": int(mod.in_features),
+                "out_features": int(mod.out_features),
+                "group_size": int(mod.group_size),
+                "residual_group": int(mod.residual_group),
+                "has_bias": mod.bias is not None,
+                "lora_rank": int(getattr(mod, "lora_rank", 0)),
+                "lora_alpha": float(getattr(mod, "lora_alpha", 0.0)),
+            }
+        elif Protected4BitLinear is not None and isinstance(mod, Protected4BitLinear):
+            int4_count += 1
+            precision_assignments[mod_name] = "int4"
+            projection_meta[mod_name] = {
+                "precision": "int4",
+                "codec": getattr(mod, "codec", "affine_uint4"),
+                "in_features": int(mod.in_features),
+                "out_features": int(mod.out_features),
+                "group_size": int(mod.group_size),
+                "has_bias": mod.bias is not None,
+                "lora_rank": int(getattr(mod, "lora_rank", 0)),
+                "lora_alpha": float(getattr(mod, "lora_alpha", 0.0)),
+            }
+
+    state = model.state_dict()
+    tensors: dict[str, Any] = {}
+    tied_tensors: dict[str, str] = {}
+    seen_storage: dict[tuple[Any, ...], str] = {}
+    tensor_sha256: dict[str, str] = {}
+    tensor_dtypes: dict[str, str] = {}
+
+    for key, val in state.items():
+        if val.data_ptr() != 0:
+            storage_key = (
+                val.device.type,
+                val.data_ptr(),
+                tuple(val.shape),
+                tuple(val.stride()),
+                str(val.dtype),
+            )
+            if storage_key in seen_storage:
+                tied_tensors[key] = seen_storage[storage_key]
+                continue
+            seen_storage[storage_key] = key
+        cpu_t = val.detach().cpu().contiguous()
+        tensors[key] = cpu_t
+        tensor_sha256[key] = _tensor_bitwise_sha256(cpu_t)
+        tensor_dtypes[key] = str(cpu_t.dtype)
+
+    # Shard tensors if shard_max_bytes is specified
+    shards_info: list[dict[str, Any]] = []
+    weight_map: dict[str, str] = {}
+    if shard_max_bytes is not None and shard_max_bytes > 0:
+        buckets: list[dict[str, Any]] = []
+        current: dict[str, Any] = {}
+        current_bytes = 0
+        for k, t in tensors.items():
+            t_bytes = t.numel() * t.element_size()
+            if current and current_bytes + t_bytes > shard_max_bytes:
+                buckets.append(current)
+                current = {}
+                current_bytes = 0
+            current[k] = t
+            current_bytes += t_bytes
+        if current:
+            buckets.append(current)
+        total_shards = max(1, len(buckets))
+        for idx, bucket in enumerate(buckets, start=1):
+            fname = f"model-{idx:05d}-of-{total_shards:05d}.safetensors"
+            fpath = out_dir / fname
+            _atomic_save_tensors(bucket, fpath)
+            shards_info.append(
+                {
+                    "file": fname,
+                    "sha256": hashlib.sha256(fpath.read_bytes()).hexdigest(),
+                    "tensor_count": len(bucket),
+                }
+            )
+            for k in bucket:
+                weight_map[k] = fname
+        write_json_atomic(
+            out_dir / "model.safetensors.index.json",
+            {"metadata": {"format": format_name}, "weight_map": weight_map},
+        )
+    else:
+        fname = "model.safetensors"
+        fpath = out_dir / fname
+        _atomic_save_tensors(tensors, fpath)
+        shards_info.append(
+            {
+                "file": fname,
+                "sha256": hashlib.sha256(fpath.read_bytes()).hexdigest(),
+                "tensor_count": len(tensors),
+            }
+        )
+        for k in tensors:
+            weight_map[k] = fname
+
+    copied_assets: list[str] = []
+    if assets_dir is not None:
+        copied_assets = _copy_clean_assets(assets_dir, out_dir / "assets")
+
+    manifest = {
+        "format": format_name,
+        "deployment_label": "effective_dense_materialization_no_packed_kernel",
+        "counts": {
+            "qtea": qtea_count,
+            "int4": int4_count,
+            "total": qtea_count + int4_count,
+        },
+        "precision_assignments": precision_assignments,
+        "projection_metadata": projection_meta,
+        "tied_tensors": tied_tensors,
+        "shards": shards_info,
+        "tensor_sha256": tensor_sha256,
+        "tensor_dtypes": tensor_dtypes,
+        "assets": copied_assets,
+        "recovery_status": recovery_status,
+        "provenance": provenance or {},
+    }
+    if plan is not None:
+        manifest["plan_summary"] = {
+            "layer_count": getattr(plan, "layer_count", None),
+            "linear_attn_layers": getattr(plan, "linear_attn_layers", None),
+            "self_attn_layers": getattr(plan, "self_attn_layers", None),
+            "mlp_layers": getattr(plan, "mlp_layers", None),
+        }
+
+    write_json_atomic(out_dir / "manifest.json", manifest)
+    return out_dir
+
+
+def verify_mixed_precision_package(package_dir: Path | str) -> dict[str, Any]:
+    """Cryptographically verify a mixed-precision package (shards, dtypes, tensor hashes).
+
+    # Errors: raises ExportError on missing files, hash mismatches, or dtype drift.
+    """
+    try:
+        from safetensors.torch import load_file
+    except ImportError as exc:
+        raise ExportError("safetensors is required for verify_mixed_precision_package") from exc
+
+    root = Path(package_dir).resolve()
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise ExportError(f"manifest.json missing in {root}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fmt = manifest.get("format")
+    if fmt not in (MIXED_PRECISION_FORMAT, "azrael-q4-fallback-v1"):
+        raise ExportError(f"Unsupported mixed-precision package format: {fmt!r}")
+
+    expected_hashes = manifest.get("tensor_sha256", {})
+    expected_dtypes = manifest.get("tensor_dtypes", {})
+    seen_tensors: set[str] = set()
+
+    for shard in manifest.get("shards", []):
+        spath = root / shard["file"]
+        if not spath.is_file():
+            raise ExportError(f"Missing shard file: {spath}")
+        actual_sha = hashlib.sha256(spath.read_bytes()).hexdigest()
+        if actual_sha != shard["sha256"]:
+            raise ExportError(f"Shard SHA-256 mismatch for {shard['file']}")
+        loaded = load_file(str(spath), device="cpu")
+        for k, t in loaded.items():
+            if k in seen_tensors:
+                raise ExportError(f"Duplicate tensor {k!r} across shards")
+            seen_tensors.add(k)
+            if k in expected_dtypes and str(t.dtype) != expected_dtypes[k]:
+                raise ExportError(
+                    f"Dtype mismatch for {k!r}: got {t.dtype}, expected {expected_dtypes[k]}"
+                )
+            if k in expected_hashes and _tensor_bitwise_sha256(t) != expected_hashes[k]:
+                raise ExportError(f"Tensor bitwise SHA-256 mismatch for {k!r}")
+
+    missing = set(expected_hashes.keys()) - seen_tensors
+    if missing:
+        raise ExportError(f"Missing tensors in shards: {sorted(missing)[:10]}")
+
+    return {
+        "verified": True,
+        "format": fmt,
+        "tensor_count": len(seen_tensors),
+        "counts": manifest.get("counts", {}),
+    }
+
+
+def load_mixed_precision_package(
+    package_dir: Path | str,
+    *,
+    model_factory: Any | None = None,
+    trust_remote_code: bool = False,
+    device: str = "cpu",
+    verify: bool = True,
+) -> Any:
+    """Load a standalone mixed-precision (or Q4 fallback) package without BF16 teacher.
+
+    Instantiates the model skeleton (via ``model_factory(assets_dir)`` or
+    ``AutoConfig`` + ``AutoModelForMultimodalLM``), replaces every target
+    projection with ``QTEALinear`` or ``Protected4BitLinear`` (including LoRA
+    recovery adapters when present), loads all state tensors strictly, restores
+    tied weights and non-persistent RoPE buffers.
+
+    # Errors: raises ExportError on verification failure, missing/unexpected keys,
+    or shape mismatches.
+    """
+    try:
+        import contextlib
+        import torch
+        from safetensors.torch import load_file
+    except ImportError as exc:
+        raise ExportError("torch and safetensors are required for load_mixed_precision_package") from exc
+
+    from .loader import restore_qwen3_5_nonpersistent_buffers
+    from .quant4 import Protected4BitLinear
+    from .qtea import QTEALinear, _set_submodule_by_name
+
+    root = Path(package_dir).resolve()
+    if verify:
+        verify_mixed_precision_package(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assets_dir = root / "assets"
+
+    @contextlib.contextmanager
+    def _init_empty():
+        try:
+            from accelerate import init_empty_weights
+
+            with init_empty_weights(include_buffers=True):
+                yield
+        except ImportError:
+            with torch.device("meta"):
+                yield
+
+    if model_factory is not None:
+        model = model_factory(assets_dir if assets_dir.is_dir() else root)
+    else:
+        from transformers import AutoConfig, AutoModelForMultimodalLM
+
+        if not (assets_dir / "config.json").is_file():
+            raise ExportError(f"assets/config.json missing in {root}")
+        cfg = AutoConfig.from_pretrained(str(assets_dir), trust_remote_code=trust_remote_code)
+        prev_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with _init_empty():
+                model = AutoModelForMultimodalLM.from_config(cfg, trust_remote_code=trust_remote_code)
+        finally:
+            torch.set_default_dtype(prev_dtype)
+
+    proj_meta = manifest.get("projection_metadata", {})
+    for mod_name, meta in proj_meta.items():
+        prec = meta["precision"]
+        if prec == "qtea":
+            rep = QTEALinear(
+                in_features=int(meta["in_features"]),
+                out_features=int(meta["out_features"]),
+                group_size=int(meta["group_size"]),
+                residual_group=int(meta["residual_group"]),
+                bias=bool(meta.get("has_bias", False)),
+                device="cpu",
+            )
+            if int(meta.get("lora_rank", 0)) > 0:
+                rep.enable_recovery_parameters(
+                    train_scales=False,
+                    lora_rank=int(meta["lora_rank"]),
+                    lora_alpha=float(meta.get("lora_alpha", meta["lora_rank"] * 2)),
+                )
+        elif prec == "int4":
+            rep = Protected4BitLinear(
+                in_features=int(meta["in_features"]),
+                out_features=int(meta["out_features"]),
+                group_size=int(meta["group_size"]),
+                bias=bool(meta.get("has_bias", False)),
+                device="cpu",
+            )
+            if int(meta.get("lora_rank", 0)) > 0:
+                rep.enable_recovery_adapters(
+                    rank=int(meta["lora_rank"]),
+                    alpha=float(meta.get("lora_alpha", meta["lora_rank"] * 2)),
+                    train_scales=False,
+                )
+        else:
+            raise ExportError(f"Unknown precision {prec!r} for {mod_name!r}")
+        _set_submodule_by_name(model, mod_name, rep)
+
+    loaded_state: dict[str, Any] = {}
+    for shard in manifest.get("shards", []):
+        loaded_state.update(load_file(str(root / shard["file"]), device="cpu"))
+
+    tied_tensors = manifest.get("tied_tensors", {})
+    expected_keys = set(model.state_dict().keys())
+    extra = set(loaded_state.keys()) - expected_keys
+    if extra:
+        raise ExportError(f"Unexpected tensors in mixed-precision checkpoint: {sorted(extra)[:10]}")
+
+    missing = expected_keys - set(loaded_state.keys()) - set(tied_tensors.keys())
+    if missing:
+        raise ExportError(f"Missing tensors in mixed-precision checkpoint: {sorted(missing)[:10]}")
+
+    # Materialize any remaining meta parameters/buffers cleanly before load_state_dict
+    for mod in model.modules():
+        for pname, p in list(mod._parameters.items()):
+            if p is not None and getattr(p, "is_meta", False):
+                mod._parameters[pname] = torch.nn.Parameter(
+                    torch.empty(p.shape, dtype=p.dtype, device="cpu"),
+                    requires_grad=p.requires_grad,
+                )
+        for bname, b in list(mod._buffers.items()):
+            if b is not None and getattr(b, "is_meta", False):
+                mod._buffers[bname] = torch.empty(b.shape, dtype=b.dtype, device="cpu")
+
+    model.load_state_dict(loaded_state, strict=False)
+
+    # Restore tied weights
+    for dst_key, src_key in tied_tensors.items():
+        if src_key not in loaded_state:
+            raise ExportError(f"Tied weight source {src_key!r} missing for {dst_key!r}")
+        src_parts = src_key.split(".")
+        src_parent = model
+        for p in src_parts[:-1]:
+            src_parent = getattr(src_parent, p)
+        src_obj = getattr(src_parent, src_parts[-1])
+
+        dst_parts = dst_key.split(".")
+        dst_parent = model
+        for p in dst_parts[:-1]:
+            dst_parent = getattr(dst_parent, p)
+        setattr(dst_parent, dst_parts[-1], src_obj)
+
+    restore_qwen3_5_nonpersistent_buffers(model)
+    if device and device != "cpu":
+        model = model.to(device)
+    model.eval()
+    return model
+
+
 __all__ = [
     "ExportManifest",
     "write_bf16_reference_artifact",
@@ -1880,4 +2290,8 @@ __all__ = [
     "QTEA_QUALITY_NOT_EVALUATED",
     "QTEA_QUALITY_ACCEPTED",
     "QTEA_QUALITY_REJECTED",
+    "MIXED_PRECISION_FORMAT",
+    "export_mixed_precision_package",
+    "verify_mixed_precision_package",
+    "load_mixed_precision_package",
 ]
