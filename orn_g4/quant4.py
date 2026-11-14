@@ -162,11 +162,40 @@ def activation_channel_scale(hessian_diag: Any, alpha: float) -> Any:
     return s.clamp(min=1e-4, max=1e4)
 
 
+def _sum_squared_diff_fp64(weight: Any, dequantized: Any) -> float:
+    """Compute ``||W - W_hat||_F^2`` in FP64 with bounded workspace memory."""
+    rows, cols = weight.shape
+    if rows * cols <= 1_000_000:
+        delta = weight.double() - dequantized.double()
+        return float((delta * delta).sum().item())
+    row_chunk = max(1, min(rows, 512))
+    total = torch.zeros((), device=weight.device, dtype=torch.float64)
+    for start in range(0, rows, row_chunk):
+        end = min(rows, start + row_chunk)
+        delta = weight[start:end].double() - dequantized[start:end].double()
+        total = total + (delta * delta).sum()
+    return float(total.item())
+
+
 def hessian_weighted_error(weight: Any, dequantized: Any, hessian: Any) -> float:
-    """``tr((W - W_hat) H (W - W_hat)^T)`` in FP64."""
-    delta = (weight.double() - dequantized.double())
-    h = hessian.to(device=delta.device, dtype=torch.float64)
-    return float(((delta @ h) * delta).sum().item())
+    """``tr((W - W_hat) H (W - W_hat)^T)`` in FP64 with row-chunked workspace for large weights."""
+    _require_torch()
+    rows, cols = weight.shape
+    h = (
+        hessian
+        if (hessian.device == weight.device and hessian.dtype == torch.float64)
+        else hessian.to(device=weight.device, dtype=torch.float64)
+    )
+    if rows * cols <= 1_000_000:
+        delta = weight.double() - dequantized.double()
+        return float(((delta @ h) * delta).sum().item())
+    row_chunk = max(1, min(rows, 512))
+    total = torch.zeros((), device=weight.device, dtype=torch.float64)
+    for start in range(0, rows, row_chunk):
+        end = min(rows, start + row_chunk)
+        delta = weight[start:end].double() - dequantized[start:end].double()
+        total = total + ((delta @ h) * delta).sum()
+    return float(total.item())
 
 
 def quantize_act_sym_int4(
@@ -194,13 +223,15 @@ def quantize_act_sym_int4(
         raise QTEAError("alphas must be non-empty")
     rows, cols = weight.shape
     w = weight.detach().float()
+    h_64: Any | None = None
     if hessian is None:
-        h = torch.eye(cols, dtype=torch.float32, device=w.device)
+        diag = torch.ones(cols, dtype=torch.float32, device=w.device)
     else:
         if tuple(hessian.shape) != (cols, cols):
             raise QTEAError(f"hessian shape {tuple(hessian.shape)} != ({cols}, {cols})")
-        h = hessian.detach().float().to(w.device)
-    diag = torch.diagonal(h)
+        h = hessian.detach()
+        diag = torch.diagonal(h).to(device=w.device, dtype=torch.float32)
+        h_64 = h.to(device=w.device, dtype=torch.float64)
 
     best: Optional[Dict[str, Any]] = None
     best_err = math.inf
@@ -211,7 +242,11 @@ def quantize_act_sym_int4(
         w_hat = dequantize_act_sym_int4(
             cand["qweight"], cand["group_scale"], cand["inv_channel_scale"], cols, group_size
         )
-        err = hessian_weighted_error(w, w_hat, h)
+        err = (
+            _sum_squared_diff_fp64(w, w_hat)
+            if h_64 is None
+            else hessian_weighted_error(w, w_hat, h_64)
+        )
         if err < best_err:  # strict: first minimum wins ties
             best, best_err, best_alpha = cand, err, float(alpha)
     assert best is not None
@@ -793,34 +828,61 @@ if _TORCH_AVAILABLE:
         from .gates import gate_ce_quality
 
         _require_torch()
+        from .lora import _extract_backbone_and_head, chunked_causal_ce_loss
+
+        def _call_with_no_cache(target: Any, kwargs: dict[str, Any]) -> Any:
+            try:
+                return target(**kwargs, use_cache=False)
+            except TypeError:
+                return target(**kwargs)
 
         def _eval_ce(model: Any) -> float:
             was_training = bool(getattr(model, "training", False))
             model.eval()
             total_nll = 0.0
             total_tok = 0
+            backbone, lm_head = _extract_backbone_and_head(model)
             try:
                 with torch.no_grad():
                     for batch in batches:
-                        fwd = {"input_ids": batch["input_ids"]}
+                        fwd: dict[str, Any] = {"input_ids": batch["input_ids"]}
                         if "attention_mask" in batch:
                             fwd["attention_mask"] = batch["attention_mask"]
-                        out = model(**fwd)
-                        logits = out.logits if hasattr(out, "logits") else out
-                        labels = batch["labels"].to(logits.device)
-                        shift_logits = logits[:, :-1, :].float()
-                        shift_labels = labels[:, 1:]
-                        valid = shift_labels.ne(-100)
-                        n_valid = int(valid.sum().item())
+                        n_valid = int(batch["labels"][:, 1:].ne(-100).sum().item())
                         if n_valid == 0:
                             continue
-                        nll = F.cross_entropy(
-                            shift_logits.reshape(-1, shift_logits.shape[-1]),
-                            shift_labels.reshape(-1),
-                            ignore_index=-100,
-                            reduction="sum",
-                        )
-                        total_nll += float(nll.item())
+                        if backbone is not None and lm_head is not None:
+                            b_out = _call_with_no_cache(backbone, fwd)
+                            last_hidden = getattr(
+                                b_out,
+                                "last_hidden_state",
+                                b_out[0] if isinstance(b_out, tuple) else b_out,
+                            )
+                            nll, n_tok = chunked_causal_ce_loss(
+                                last_hidden,
+                                lm_head,
+                                batch["labels"].to(last_hidden.device),
+                                chunk_size=256,
+                                shift_labels=True,
+                                grad_checkpoint=False,
+                            )
+                            total_nll += float(nll.item())
+                            total_tok += int(n_tok)
+                            continue
+                        out = _call_with_no_cache(model, fwd)
+                        logits = out.logits if hasattr(out, "logits") else out
+                        labels = batch["labels"].to(logits.device)
+                        shift_logits = logits[:, :-1, :]
+                        shift_labels = labels[:, 1:]
+                        seq_len = shift_logits.shape[1]
+                        for start in range(0, seq_len, 256):
+                            end = min(seq_len, start + 256)
+                            chunk_lbl = shift_labels[:, start:end].reshape(-1)
+                            if not bool(chunk_lbl.ne(-100).any().item()):
+                                continue
+                            chunk_log = shift_logits[:, start:end, :].float().reshape(-1, shift_logits.shape[-1])
+                            nll = F.cross_entropy(chunk_log, chunk_lbl, ignore_index=-100, reduction="sum")
+                            total_nll += float(nll.item())
                         total_tok += n_valid
             finally:
                 if was_training:

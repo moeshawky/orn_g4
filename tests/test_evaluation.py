@@ -337,3 +337,56 @@ def test_package_reexports_and_cpu_no_torch_import_safety() -> None:
         check=False,
     )
     assert proc.returncode == 0, f"no-torch import failed: {proc.stderr}\n{proc.stdout}"
+
+
+def test_trace_replay_followup_closes_think_and_preserves_turn1() -> None:
+    """Trace replay carries Turn-1 output, closes open </think>, and separates Turn-2 thinking."""
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            tokenize: bool,
+            add_generation_prompt: bool,
+            enable_thinking: bool,
+        ) -> str:
+            assert tokenize is False and add_generation_prompt is True
+            tag = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+            return f"<|im_start|>user\n{messages[0]['content']}<|im_end|>\n<|im_start|>assistant\n{tag}"
+
+    prompts_seen: list[str] = []
+
+    def _gen_good(prompt: str, max_tokens: int) -> str:
+        prompts_seen.append(prompt)
+        if len(prompts_seen) == 1:
+            return (
+                "I should call read_file.\n</think>\n\n"
+                "<tool_call>\n<function=read_file>\n<parameter=path>missing.txt</parameter>\n</function>\n</tool_call><|im_end|>"
+            )
+        assert "</tool_call>" in prompt
+        assert "</think>\n<|im_end|>\n<|im_start|>user\nTOOL OBSERVATION:" in prompt or "<|im_end|>\n<|im_start|>user\nTOOL OBSERVATION:" in prompt
+        assert prompt.count("<think>") > prompt.count("</think>")
+        assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+        return "Check alternatives.\n</think>\n\nThe file missing.txt does not exist; switching to fallback strategy."
+
+    case = EvalCase(
+        case_id="rec_case",
+        category="recovery",
+        prompt="Inspect missing.txt and recover if absent.",
+        tool_observation="Tool Error: FileNotFoundError",
+        enable_thinking=True,
+    )
+    rep = run_acceptance_suite([case], _gen_good, split="probe", mode="trace_replay", tokenizer=_FakeTokenizer())
+    assert len(prompts_seen) == 2
+    assert rep.cases[0].passed is True
+    assert rep.cases[0].recovered_after_failure is True
+
+    # Negative control: recovery keywords inside Turn-2 <think> only must NOT pass recovery
+    def _gen_hidden_in_think(prompt: str, max_tokens: int) -> str:
+        if "TOOL OBSERVATION:" not in prompt:
+            return "Thinking.\n</think>\n\n<tool_call>\n<function=read_file>\n<parameter=path>missing.txt</parameter>\n</function>\n</tool_call>"
+        return "File does not exist so I should try fallback.\n</think>\n\nOK."
+
+    rep_bad = run_acceptance_suite([case], _gen_hidden_in_think, split="probe", mode="trace_replay", tokenizer=_FakeTokenizer())
+    assert rep_bad.cases[0].recovered_after_failure is False
+    assert rep_bad.cases[0].passed is False

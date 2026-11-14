@@ -1620,6 +1620,22 @@ def _atomic_torch_save(obj: dict[str, Any], path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _call_forward_no_cache(target_fn: Any, fwd_kwargs: dict[str, Any]) -> Any:
+    """Invoke model/backbone forward with ``use_cache=False`` and graceful signature fallback."""
+    try:
+        return target_fn(**fwd_kwargs)
+    except TypeError:
+        stripped = dict(fwd_kwargs)
+        if "output_hidden_states" in stripped:
+            stripped.pop("output_hidden_states", None)
+            try:
+                return target_fn(**stripped)
+            except TypeError:
+                pass
+        stripped.pop("use_cache", None)
+        return target_fn(**stripped)
+
+
 def _forward_recovery_step(
     model: Any,
     batch: dict[str, Any],
@@ -1629,20 +1645,21 @@ def _forward_recovery_step(
     backbone: Any | None = None,
     lm_head: Any | None = None,
 ) -> tuple[Any, dict[str, float]]:
-    fwd_kwargs: dict[str, Any] = {"input_ids": batch["input_ids"]}
+    need_hidden = (
+        cfg.mu_hidden > 0.0
+        and t_entry is not None
+        and bool(t_entry.get("hidden_states"))
+    )
+    fwd_kwargs: dict[str, Any] = {"input_ids": batch["input_ids"], "use_cache": False}
     if "attention_mask" in batch:
         fwd_kwargs["attention_mask"] = batch["attention_mask"]
-    if cfg.mu_hidden > 0.0:
+    if need_hidden:
         fwd_kwargs["output_hidden_states"] = True
 
     if backbone is not None and lm_head is not None:
-        try:
-            b_out = backbone(**fwd_kwargs)
-        except TypeError:
-            fwd_kwargs.pop("output_hidden_states", None)
-            b_out = backbone(**fwd_kwargs)
+        b_out = _call_forward_no_cache(backbone, fwd_kwargs)
         last_hidden = getattr(b_out, "last_hidden_state", b_out[0] if isinstance(b_out, tuple) else b_out)
-        hidden = getattr(b_out, "hidden_states", None)
+        hidden = getattr(b_out, "hidden_states", None) if need_hidden else None
         return compute_fused_chunked_kl_loss(
             last_hidden,
             lm_head,
@@ -1657,13 +1674,9 @@ def _forward_recovery_step(
             topk_tail_bucket=cfg.topk_tail_bucket,
         )
 
-    try:
-        out = model(**fwd_kwargs)
-    except TypeError:
-        fwd_kwargs.pop("output_hidden_states", None)
-        out = model(**fwd_kwargs)
+    out = _call_forward_no_cache(model, fwd_kwargs)
     logits = getattr(out, "logits", out[0] if isinstance(out, tuple) else out)
-    hidden = getattr(out, "hidden_states", None)
+    hidden = getattr(out, "hidden_states", None) if need_hidden else None
     return compute_recovery_loss(
         logits,
         batch["labels"],
@@ -1892,8 +1905,9 @@ def train_mixed_precision_recovery(
             batch_cursor = (batch_cursor + 1) % total_batches
             tokens_consumed += int(metrics["supervised_tokens"])
             history.append({"step": float(step), **metrics})
+            is_last = step >= target_steps or tokens_consumed >= cfg.supervised_token_budget
 
-            if step % accum == 0 or step >= target_steps:
+            if step % accum == 0 or is_last:
                 for p in trainable:
                     if p.grad is not None and not torch.isfinite(p.grad).all():
                         raise RecoveryError(f"Non-finite gradient detected at step {step}")
@@ -1902,7 +1916,7 @@ def train_mixed_precision_recovery(
                 scheduler.step()
                 optimizer.zero_grad()
 
-            if eval_batches and (step % max(1, cfg.eval_every_steps) == 0 or step >= target_steps):
+            if eval_batches and (step % max(1, cfg.eval_every_steps) == 0 or is_last):
                 ev_loss = _eval_heldout_loss(
                     model,
                     eval_batches,
@@ -1929,7 +1943,7 @@ def train_mixed_precision_recovery(
                 elif ev_loss < best_eval_loss:
                     best_eval_loss = ev_loss
 
-            if latest_path is not None and (step % max(1, cfg.checkpoint_every_steps) == 0 or step >= target_steps):
+            if latest_path is not None and (step % max(1, cfg.checkpoint_every_steps) == 0 or is_last):
                 _atomic_torch_save(
                     {
                         "step": step,

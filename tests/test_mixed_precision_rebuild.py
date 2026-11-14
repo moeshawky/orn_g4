@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -1196,10 +1197,38 @@ def test_lora_8192_full_trajectory_chunked_ce_and_stateful_resume(tmp_path: Path
     metrics_b = run_sft_gradient_accumulation_step(
         model_norm_b, [comb], opt_b, scheduler=sched_b, config=small_cfg
     )
+    # Check pre-step gradient parity tightly before AdamW sign(g) threshold amplifies 1e-7 BF16 diffs by 2*lr.
+    class _RecordingNoOpOpt:
+        def __init__(self, model_ref: torch.nn.Module) -> None:
+            self.named_params = [(n, p) for n, p in model_ref.named_parameters() if p.requires_grad]
+            self.param_groups = [{"params": [p for _, p in self.named_params], "lr": small_cfg.lr}]
+            self.captured_grads: dict[str, torch.Tensor] = {}
+
+        def zero_grad(self, set_to_none: bool = True) -> None:
+            for _, p in self.named_params:
+                p.grad = None
+
+        def step(self) -> None:
+            for n, p in self.named_params:
+                assert p.grad is not None, f"missing grad for {n}"
+                self.captured_grads[n] = p.grad.detach().clone()
+
+    grad_a_m = copy.deepcopy(model)
+    grad_b_m = copy.deepcopy(model)
+    rec_a = _RecordingNoOpOpt(grad_a_m)
+    rec_b = _RecordingNoOpOpt(grad_b_m)
+    run_sft_gradient_accumulation_step(grad_a_m, [mb1, mb2], rec_a, config=small_cfg)
+    run_sft_gradient_accumulation_step(grad_b_m, [comb], rec_b, config=small_cfg)
+    assert set(rec_a.captured_grads) == set(rec_b.captured_grads)
+    for n, ga in rec_a.captured_grads.items():
+        # BF16 activations (7 mantissa bits) allow ~1e-2 rel / ~2e-5 abs batch-vs-microbatch rounding vs >50% weighting bugs.
+        assert torch.allclose(ga, rec_b.captured_grads[n], rtol=1e-2, atol=5e-5), f"grad mismatch in {n}"
+
     assert metrics_a["loss"] == pytest.approx(metrics_b["loss"], rel=1e-4, abs=1e-4)
     for (n, pa), (_, pb) in zip(model_norm_a.named_parameters(), model_norm_b.named_parameters()):
         if pa.requires_grad:
-            assert torch.allclose(pa, pb, atol=1e-6), f"mismatch in {n}"
+            # AdamW(lr=5e-5) flips sign(g) across +/-0 for tiny <1e-6 BF16 grad deltas (bounded by 2 * lr = 1e-4).
+            assert torch.allclose(pa, pb, atol=1e-4), f"mismatch in {n}"
 
     # 3. Full 8192-token trajectory forward+backward+step + stateful checkpoint/resume + BF16 adapter export
     # Use a 1-layer linear_attention Qwen3_5ForCausalLM for 8192-token CPU execution (~3s instead of O(T^2) CPU SDPA)
@@ -1453,3 +1482,160 @@ def test_gguf_q4_k_m_fallback_export_and_f16_gdn_gate_verification(tmp_path: Pat
     _write_test_gguf(unquantized, include_q4k=False)
     with pytest.raises(ExportError, match="zero Q4_K quantized tensors"):
         verify_gguf_fallback(unquantized)
+
+
+def test_recovery_hidden_skip_use_cache_and_token_budget_flush(tmp_path: Path) -> None:
+    """Verify use_cache=False, no output_hidden_states without cached hidden, and flush/eval on budget exit."""
+    from orn_g4.recovery import (
+        MixedPrecisionRecoveryConfig,
+        _forward_recovery_step,
+        train_mixed_precision_recovery,
+    )
+
+    seen_calls: list[dict[str, object]] = []
+
+    class _RecordingTinyLM(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.emb = torch.nn.Embedding(16, 8)
+            self.proj = torch.nn.Linear(8, 16)
+            self.proj.weight.data = self.proj.weight.data.float()
+            self.proj.bias.data = self.proj.bias.data.float()
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            use_cache: bool | None = None,
+            output_hidden_states: bool | None = None,
+        ) -> Any:
+            seen_calls.append({"use_cache": use_cache, "output_hidden_states": output_hidden_states})
+            logits = self.proj(self.emb(input_ids))
+            return type("_Out", (), {"logits": logits, "hidden_states": None})()
+
+    m = _RecordingTinyLM()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.tensor([[-100, 2, 3, 4]]),
+    }
+    cfg = MixedPrecisionRecoveryConfig(
+        ce_weight=1.0,
+        lambda_kl=0.0,
+        mu_hidden=0.5,
+        grad_accum_steps=4,
+        eval_every_steps=100,
+        checkpoint_every_steps=100,
+        supervised_token_budget=3,
+    )
+    loss, _ = _forward_recovery_step(m, batch, {"topk_ids": torch.zeros(1, 4, 2, dtype=torch.long)}, cfg)
+    assert loss.isfinite()
+    assert seen_calls[-1]["use_cache"] is False
+    assert seen_calls[-1]["output_hidden_states"] is None
+
+    # Early exit via supervised_token_budget=3 before step >= target_steps=10 or grad_accum_steps=4
+    batches = [batch, batch, batch]
+    res = train_mixed_precision_recovery(
+        m,
+        batches,
+        eval_batches=[batch],
+        config=cfg,
+        run_dir=tmp_path / "budget_stop",
+        max_steps=10,
+    )
+    assert res["steps_completed"] == 1
+    assert len(res["eval_history"]) == 1
+    assert (tmp_path / "budget_stop" / "recovery_state" / "latest.pt").is_file()
+
+
+def test_quant4_chunked_hessian_and_vocab_int8_chunked_ce() -> None:
+    """Verify row-chunked FP64 hessian error matches dense FP64 and measure_vocab_int8_delta_ce uses no_cache."""
+    from orn_g4.errors import QualityGateError
+    from orn_g4.quant4 import (
+        convert_vocab_int8,
+        hessian_weighted_error,
+        measure_vocab_int8_delta_ce,
+        quantize_act_sym_int4,
+    )
+
+    torch.manual_seed(9)
+    # Force row-chunked path (rows * cols > 1_000_000)
+    w = torch.randn(1024, 1024, dtype=torch.float32)
+    w_hat = w + 0.01 * torch.randn_like(w)
+    h = torch.eye(1024, dtype=torch.float32) * 2.0
+    delta = w.double() - w_hat.double()
+    expected = float(((delta @ h.double()) * delta).sum().item())
+    assert hessian_weighted_error(w, w_hat, h) == pytest.approx(expected, rel=1e-12)
+
+    q_no_h = quantize_act_sym_int4(torch.randn(32, 128), hessian=None, group_size=128)
+    assert q_no_h["alpha"] == 0.0
+    assert q_no_h["hessian_error"] >= 0.0
+
+    # Verify measure_vocab_int8_delta_ce chunked logits fallback + use_cache=False
+    class _CheckNoCacheLM(torch.nn.Module):
+        def __init__(self, *, corrupt: bool = False) -> None:
+            super().__init__()
+            self.embed = torch.nn.Embedding(128, 16)
+            self.head = torch.nn.Linear(16, 128, bias=False)
+            self.use_cache_flags: list[bool | None] = []
+            if corrupt:
+                with torch.no_grad():
+                    self.head.weight.zero_()
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            use_cache: bool | None = None,
+        ) -> Any:
+            self.use_cache_flags.append(use_cache)
+            return type("_Out", (), {"logits": self.head(self.embed(input_ids))})()
+
+    ref_m = _CheckNoCacheLM()
+    with torch.no_grad():
+        ref_m.head.weight.mul_(4.0)
+    good_m = copy.deepcopy(ref_m)
+    bad_m = _CheckNoCacheLM(corrupt=True)
+    # seq_len=300 crosses the 256-token chunk boundary in the fallback path; target ref's own predictions
+    b_ids = torch.randint(0, 128, (1, 300))
+    with torch.no_grad():
+        preds = ref_m(b_ids).logits.argmax(dim=-1)
+    ref_m.use_cache_flags.clear()
+    b_lbl = torch.full_like(b_ids, -100)
+    b_lbl[:, 1:] = preds[:, :-1]
+    b_lbl[:, :10] = -100
+    b_list = [{"input_ids": b_ids, "attention_mask": torch.ones_like(b_ids), "labels": b_lbl}]
+    res_good = measure_vocab_int8_delta_ce(ref_m, good_m, b_list, max_regression=0.05)
+    assert res_good["delta_ce"] == pytest.approx(0.0, abs=1e-6)
+    assert ref_m.use_cache_flags == [False] and good_m.use_cache_flags == [False]
+
+    # Also test inplace=True on real skeleton model with chunked CE path
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    s_cfg = Qwen3_5TextConfig(
+        vocab_size=256,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    q_ref = Qwen3_5ForCausalLM(s_cfg).to(torch.bfloat16)
+    q_int8, _ = convert_vocab_int8(q_ref, group_size=128, inplace=False)
+    ids2 = torch.randint(0, 256, (1, 40))
+    gate_res = measure_vocab_int8_delta_ce(
+        q_ref,
+        q_int8,
+        [{"input_ids": ids2, "attention_mask": torch.ones_like(ids2), "labels": ids2}],
+        max_regression=0.25,
+    )
+    assert gate_res["passed"] is True
+    with pytest.raises(QualityGateError, match="CE degradation"):
+        measure_vocab_int8_delta_ce(ref_m, bad_m, b_list, max_regression=0.01)

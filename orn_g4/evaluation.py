@@ -303,6 +303,35 @@ def _evaluate_coding_output(
     return True, True, "coding assertions passed"
 
 
+def _build_trace_replay_followup(
+    effective_prompt: str,
+    *,
+    first_output: str,
+    observation: str,
+    enable_thinking: bool,
+) -> str:
+    """Format a Turn-2 trace_replay continuation preserving Turn-1 output and ``<think>`` boundaries."""
+    turn1_out = first_output.rstrip()
+    if turn1_out.endswith("<|im_end|>"):
+        turn1_out = turn1_out[: -len("<|im_end|>")].rstrip()
+
+    prefix = f"{effective_prompt}{turn1_out}"
+    if prefix.count("<think>") > prefix.count("</think>"):
+        prefix = f"{prefix}\n</think>\n"
+
+    obs_msg = f"TOOL OBSERVATION: {observation}\n\nContinue."
+    if "<|im_start|>" in effective_prompt:
+        followup = (
+            f"{prefix}<|im_end|>\n"
+            f"<|im_start|>user\n{obs_msg}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        return f"{followup}<think>\n" if enable_thinking else followup
+
+    followup = f"{prefix}\n\n{obs_msg}"
+    return f"{followup}\n<think>\n" if enable_thinking else followup
+
+
 def evaluate_case(
     case: EvalCase,
     generate_fn: Any,
@@ -379,8 +408,13 @@ def evaluate_case(
     tokens_used = len(output.split())
 
     if mode == "trace_replay" and case.tool_observation is not None:
-        # Inject the tool observation and test the model's response.
-        followup = effective_prompt + "\n\nTOOL OBSERVATION: " + case.tool_observation + "\n\nContinue."
+        # Inject the tool observation as a proper follow-up turn after Turn-1 output.
+        followup = _build_trace_replay_followup(
+            effective_prompt,
+            first_output=output,
+            observation=case.tool_observation,
+            enable_thinking=case.enable_thinking,
+        )
         followup_output = generate_fn(followup, case.max_tokens)
         _, _, followup_visible = extract_thinking_and_response(
             followup_output,
