@@ -905,7 +905,7 @@ def gate_top1_parity(ref_logits: Any, reload_logits: Any) -> bool:
     """Verify top-1 token prediction identity across all positions."""
     from .errors import QualityGateError
 
-    if hasattr(ref_logits, "argmax"):
+    if hasattr(ref_logits, "detach"):
         ref_tokens = ref_logits.detach().argmax(dim=-1)
         reload_tokens = reload_logits.detach().argmax(dim=-1)
         match = bool(torch.equal(ref_tokens, reload_tokens))

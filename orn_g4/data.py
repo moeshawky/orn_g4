@@ -394,6 +394,8 @@ def resolve_shards(
         if isinstance(item, dict):
             name = str(item.get("path") or item.get("file") or item.get("name") or "")
             checksum = item.get("sha256") or item.get("checksum")
+            if checksum is None and isinstance(manifest.get("checksums"), dict):
+                checksum = manifest["checksums"].get(name) or manifest["checksums"].get(Path(name).name)
             num_examples = item.get("rows") or item.get("num_examples")
         else:
             name = str(item)
@@ -419,17 +421,21 @@ def resolve_shards(
         resolved = None
         for cp in candidate_paths:
             if cp.is_file():
-                resolved = cp
+                resolved = cp.resolve()
                 break
         if resolved is None:
             # Directory-based shard: look inside candidate dirs
             for cd in (train_ready / name, root / name, train_ready / base_name):
                 if cd.is_dir():
-                    resolved = cd
+                    resolved = cd.resolve()
                     break
         if resolved is None:
             raise DatasetError(
                 f"declared shard {name!r} not found under {root} or {train_ready}"
+            )
+        if not resolved.is_relative_to(root):
+            raise DatasetError(
+                f"declared shard {name!r} resolves outside dataset root {root}: {resolved}"
             )
 
         # Skip shards residing in excluded directories (e.g. eval_firewall)
@@ -453,6 +459,13 @@ def resolve_shards(
             )
         else:
             array_names = _discover_arrays_in_shard(resolved)
+            if num_examples is None and resolved.suffix.lower() == ".parquet":
+                try:
+                    import pyarrow.parquet as pq
+
+                    num_examples = int(pq.read_metadata(str(resolved)).num_rows)
+                except Exception:  # noqa: S110
+                    pass
             ok = None
             if checksum is not None:
                 actual_sha = sha256_file(resolved)
@@ -511,10 +524,19 @@ def build_layout(
         local_copy = copy_zip_to_local(resolved, local_dir)
         exdir = extract_zip(local_copy, extract_dir)
         droot = resolve_dataset_root(exdir)
+        v2_zip_root = droot / "release" / "azrael-sft-v2"
+        if (v2_zip_root / "DATASET_RELEASE_MANIFEST.json").is_file():
+            droot = v2_zip_root
         zip_file_path: Path | None = local_copy
     elif resolved.is_dir():
         exdir = resolved
-        if (resolved / "DATASET_RELEASE_MANIFEST.json").is_file() or (resolved / "train_ready").is_dir():
+        v2_root = resolved / "release" / "azrael-sft-v2"
+        v2_nested = resolved / "azrael-dataset" / "release" / "azrael-sft-v2"
+        if (v2_root / "DATASET_RELEASE_MANIFEST.json").is_file():
+            droot = v2_root
+        elif (v2_nested / "DATASET_RELEASE_MANIFEST.json").is_file():
+            droot = v2_nested
+        elif (resolved / "DATASET_RELEASE_MANIFEST.json").is_file() or (resolved / "train_ready").is_dir():
             droot = resolved
         elif (resolved / "azrael-dataset" / "DATASET_RELEASE_MANIFEST.json").is_file():
             droot = resolved / "azrael-dataset"

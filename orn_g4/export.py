@@ -1896,35 +1896,60 @@ def export_mixed_precision_package(
     provenance: dict[str, Any] | None = None,
     recovery_status: str = "recovered",
     format_name: str = MIXED_PRECISION_FORMAT,
+    quantize_vocab_int8: bool = False,
+    vocab_group_size: int = 128,
+    variant: str | None = None,
+    post_int8_delta_ce: float | None = None,
 ) -> Path:
     """Export a standalone mixed-precision (QTEA + Protected4Bit + preserved) package.
 
     Preserves packed ternary codes, FP8 residuals, continuous QTEA scales,
-    4-bit affine weights, optional rank-16 LoRA adapters, tied weights, and
-    preserved tensors in SafeTensors format without BF16 teacher dependency.
+    4-bit activation-aware weights, optional rank-16 LoRA adapters (serialized as
+    BF16), symmetric group-128 INT8 vocab/head modules, preserved BF16
+    projections, and tied weights in SafeTensors format without BF16 teacher
+    dependency.
 
     # Errors: raises ExportError if PyTorch/safetensors are unavailable or
     weight serialization fails.
     """
     try:
         import torch
+        import torch.nn as nn
         from safetensors.torch import save_file
     except ImportError as exc:
         raise ExportError("torch and safetensors are required for export_mixed_precision_package") from exc
 
-    from .quant4 import Protected4BitLinear
-    from .qtea import QTEALinear
+    from .quant4 import (
+        INT8_CODEC_NAME,
+        Protected4BitLinear,
+        QuantizedInt8Embedding,
+        QuantizedInt8Linear,
+        convert_vocab_int8,
+    )
+    from .qtea import QTEALinear, discover_mixed_precision_targets
     from .utils import write_json_atomic
+
+    work_model = model
+    if quantize_vocab_int8:
+        work_model, _ = convert_vocab_int8(work_model, group_size=vocab_group_size, inplace=False)
 
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if variant is not None:
+        resolved_variant = str(variant)
+    elif hasattr(work_model, "language_model") or hasattr(work_model, "visual"):
+        resolved_variant = "multimodal"
+    else:
+        resolved_variant = "text_only"
+
     projection_meta: dict[str, dict[str, Any]] = {}
     precision_assignments: dict[str, str] = {}
+    vocab_modules: dict[str, dict[str, Any]] = {}
     qtea_count = 0
     int4_count = 0
 
-    for mod_name, mod in model.named_modules():
+    for mod_name, mod in work_model.named_modules():
         if isinstance(mod, QTEALinear):
             qtea_count += 1
             precision_assignments[mod_name] = "qtea"
@@ -1943,7 +1968,7 @@ def export_mixed_precision_package(
             precision_assignments[mod_name] = "int4"
             projection_meta[mod_name] = {
                 "precision": "int4",
-                "codec": getattr(mod, "codec", "affine_uint4"),
+                "codec": getattr(mod, "codec", "act_sym_int4_g128"),
                 "in_features": int(mod.in_features),
                 "out_features": int(mod.out_features),
                 "group_size": int(mod.group_size),
@@ -1951,8 +1976,50 @@ def export_mixed_precision_package(
                 "lora_rank": int(getattr(mod, "lora_rank", 0)),
                 "lora_alpha": float(getattr(mod, "lora_alpha", 0.0)),
             }
+        elif QuantizedInt8Embedding is not None and isinstance(mod, QuantizedInt8Embedding):
+            vocab_modules[mod_name] = {
+                "kind": "embedding",
+                "codec": getattr(mod, "codec", INT8_CODEC_NAME),
+                "num_embeddings": int(mod.num_embeddings),
+                "embedding_dim": int(mod.embedding_dim),
+                "group_size": int(mod.group_size),
+                "padding_idx": mod.padding_idx,
+                "out_dtype": getattr(mod, "out_dtype_name", "float32"),
+            }
+        elif QuantizedInt8Linear is not None and isinstance(mod, QuantizedInt8Linear):
+            vocab_modules[mod_name] = {
+                "kind": "linear",
+                "codec": getattr(mod, "codec", INT8_CODEC_NAME),
+                "in_features": int(mod.in_features),
+                "out_features": int(mod.out_features),
+                "group_size": int(mod.group_size),
+                "has_bias": mod.bias is not None,
+            }
 
-    state = model.state_dict()
+    # Account for preserved BF16 projections cleanly in mixed-precision manifests.
+    bf16_projections: list[str] = []
+    if format_name == MIXED_PRECISION_FORMAT:
+        if plan is not None and hasattr(plan, "bf16_targets"):
+            bf16_candidates = [str(t.name) for t in plan.bf16_targets]
+        else:
+            try:
+                auto_plan = discover_mixed_precision_targets(work_model, strict=False)
+                bf16_candidates = [str(t.name) for t in auto_plan.bf16_targets]
+            except Exception:
+                bf16_candidates = []
+
+        named_mods = dict(work_model.named_modules())
+        for bf16_name in bf16_candidates:
+            mod = named_mods.get(bf16_name)
+            if mod is None or type(mod) is not nn.Linear:
+                raise ExportError(
+                    f"Preserved BF16 projection {bf16_name!r} missing or unexpectedly converted to {type(mod).__name__ if mod is not None else None}"
+                )
+            bf16_projections.append(bf16_name)
+            precision_assignments[bf16_name] = "bf16"
+        bf16_projections = sorted(set(bf16_projections))
+
+    state = work_model.state_dict()
     tensors: dict[str, Any] = {}
     tied_tensors: dict[str, str] = {}
     seen_storage: dict[tuple[Any, ...], str] = {}
@@ -1973,6 +2040,9 @@ def export_mixed_precision_package(
                 continue
             seen_storage[storage_key] = key
         cpu_t = val.detach().cpu().contiguous()
+        if key.endswith((".lora_A", ".lora_B")) and cpu_t.is_floating_point():
+            # Trainable adapters are FP32 in memory and BF16 at export (ADV-12.1 D).
+            cpu_t = cpu_t.to(torch.bfloat16).contiguous()
         tensors[key] = cpu_t
         tensor_sha256[key] = _tensor_bitwise_sha256(cpu_t)
         tensor_dtypes[key] = str(cpu_t.dtype)
@@ -2032,11 +2102,21 @@ def export_mixed_precision_package(
 
     manifest = {
         "format": format_name,
+        "variant": resolved_variant,
         "deployment_label": "effective_dense_materialization_no_packed_kernel",
         "counts": {
             "qtea": qtea_count,
             "int4": int4_count,
             "total": qtea_count + int4_count,
+        },
+        "bf16_count": len(bf16_projections),
+        "bf16_projections": bf16_projections,
+        "vocab_int8": {
+            "codec": INT8_CODEC_NAME,
+            "group_size": int(vocab_group_size),
+            "count": len(vocab_modules),
+            "post_int8_delta_ce": post_int8_delta_ce,
+            "modules": vocab_modules,
         },
         "precision_assignments": precision_assignments,
         "projection_metadata": projection_meta,
@@ -2106,11 +2186,47 @@ def verify_mixed_precision_package(package_dir: Path | str) -> dict[str, Any]:
     if missing:
         raise ExportError(f"Missing tensors in shards: {sorted(missing)[:10]}")
 
+    tied_tensors = manifest.get("tied_tensors", {})
+    def _has_stored_tensor(tensor_name: str) -> str | None:
+        if tensor_name in seen_tensors:
+            return tensor_name
+        src = tied_tensors.get(tensor_name)
+        if src and src in seen_tensors:
+            return src
+        return None
+
+    bf16_projections = manifest.get("bf16_projections", [])
+    for bf16_name in bf16_projections:
+        resolved_key = _has_stored_tensor(f"{bf16_name}.weight")
+        if resolved_key is None:
+            raise ExportError(f"Missing preserved BF16 projection tensor for {bf16_name!r}")
+        dt = expected_dtypes.get(resolved_key, "")
+        if dt and dt not in ("torch.bfloat16", "torch.float32", "torch.float16"):
+            raise ExportError(
+                f"Preserved BF16 projection {bf16_name!r} has non-float dtype {dt!r}"
+            )
+
+    vocab_info = manifest.get("vocab_int8", {})
+    vocab_modules = vocab_info.get("modules", {})
+    for v_name in vocab_modules:
+        q_key = _has_stored_tensor(f"{v_name}.qweight")
+        s_key = _has_stored_tensor(f"{v_name}.scale")
+        if q_key is None or s_key is None:
+            raise ExportError(f"Missing INT8 vocab buffers for {v_name!r}")
+        if expected_dtypes.get(q_key) != "torch.int8":
+            raise ExportError(f"INT8 vocab {v_name!r} qweight dtype must be int8, got {expected_dtypes.get(q_key)!r}")
+        if expected_dtypes.get(s_key) != "torch.bfloat16":
+            raise ExportError(f"INT8 vocab {v_name!r} scale dtype must be bfloat16, got {expected_dtypes.get(s_key)!r}")
+
     return {
         "verified": True,
         "format": fmt,
+        "variant": manifest.get("variant", "multimodal"),
         "tensor_count": len(seen_tensors),
         "counts": manifest.get("counts", {}),
+        "bf16_count": len(bf16_projections),
+        "bf16_projections": list(bf16_projections),
+        "vocab_int8_count": len(vocab_modules),
     }
 
 
@@ -2141,7 +2257,7 @@ def load_mixed_precision_package(
         raise ExportError("torch and safetensors are required for load_mixed_precision_package") from exc
 
     from .loader import restore_qwen3_5_nonpersistent_buffers
-    from .quant4 import Protected4BitLinear
+    from .quant4 import Protected4BitLinear, QuantizedInt8Embedding, QuantizedInt8Linear
     from .qtea import QTEALinear, _set_submodule_by_name
 
     root = Path(package_dir).resolve()
@@ -2164,16 +2280,25 @@ def load_mixed_precision_package(
     if model_factory is not None:
         model = model_factory(assets_dir if assets_dir.is_dir() else root)
     else:
-        from transformers import AutoConfig, AutoModelForMultimodalLM
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForMultimodalLM
 
         if not (assets_dir / "config.json").is_file():
             raise ExportError(f"assets/config.json missing in {root}")
         cfg = AutoConfig.from_pretrained(str(assets_dir), trust_remote_code=trust_remote_code)
+        variant = manifest.get("variant")
+        use_causal = variant == "text_only" or (
+            variant is None
+            and not hasattr(cfg, "vision_config")
+            and getattr(cfg, "model_type", "") in {"qwen3_5_text", "qwen3_5", "qwen2", "llama"}
+        )
         prev_dtype = torch.get_default_dtype()
         try:
             torch.set_default_dtype(torch.bfloat16)
             with _init_empty():
-                model = AutoModelForMultimodalLM.from_config(cfg, trust_remote_code=trust_remote_code)
+                if use_causal:
+                    model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=trust_remote_code)
+                else:
+                    model = AutoModelForMultimodalLM.from_config(cfg, trust_remote_code=trust_remote_code)
         finally:
             torch.set_default_dtype(prev_dtype)
 
@@ -2212,6 +2337,41 @@ def load_mixed_precision_package(
         else:
             raise ExportError(f"Unknown precision {prec!r} for {mod_name!r}")
         _set_submodule_by_name(model, mod_name, rep)
+
+    vocab_modules = manifest.get("vocab_int8", {}).get("modules", {})
+    for v_name, v_meta in vocab_modules.items():
+        v_kind = v_meta["kind"]
+        if v_kind == "embedding":
+            v_rep = QuantizedInt8Embedding(
+                num_embeddings=int(v_meta["num_embeddings"]),
+                embedding_dim=int(v_meta["embedding_dim"]),
+                group_size=int(v_meta["group_size"]),
+                padding_idx=v_meta.get("padding_idx"),
+                out_dtype=v_meta.get("out_dtype", "float32"),
+                device="cpu",
+            )
+        elif v_kind == "linear":
+            v_rep = QuantizedInt8Linear(
+                in_features=int(v_meta["in_features"]),
+                out_features=int(v_meta["out_features"]),
+                group_size=int(v_meta["group_size"]),
+                bias=bool(v_meta.get("has_bias", False)),
+                device="cpu",
+            )
+        else:
+            raise ExportError(f"Unknown vocab_int8 module kind {v_kind!r} for {v_name!r}")
+        _set_submodule_by_name(model, v_name, v_rep)
+
+    # Strict verification of preserved BF16 projections on the instantiated model.
+    import torch.nn as nn
+
+    named_mods = dict(model.named_modules())
+    for bf16_name in manifest.get("bf16_projections", []):
+        bf16_mod = named_mods.get(bf16_name)
+        if bf16_mod is None or type(bf16_mod) is not nn.Linear:
+            raise ExportError(
+                f"Preserved BF16 projection {bf16_name!r} missing or replaced by {type(bf16_mod).__name__ if bf16_mod is not None else None}"
+            )
 
     loaded_state: dict[str, Any] = {}
     for shard in manifest.get("shards", []):

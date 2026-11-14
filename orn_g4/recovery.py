@@ -816,19 +816,27 @@ __all__ = [
 
 @dataclass(frozen=True)
 class MixedPrecisionRecoveryConfig:
-    """Configuration for teacher-guided mixed-precision recovery."""
+    """Configuration for teacher-guided mixed-precision recovery (ADV-12.1 frozen defaults)."""
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
     train_qtea_scales: bool = True
     train_int4_scales: bool = False
-    lr: float = 1e-4
+    adapter_lr: float = 5e-5
+    scale_lr: float = 5e-6
+    lr: float | None = None
     weight_decay: float = 0.0
+    warmup_ratio: float = 0.10
+    lr_scheduler_type: str = "cosine"
+    ce_weight: float = 0.0
     lambda_kl: float = 1.0
     mu_hidden: float = 0.1
-    temperature: float = 2.0
-    top_k_logits: int | None = 64
-    grad_accum_steps: int = 1
+    temperature: float = 1.0
+    top_k_logits: int | None = 128
+    topk_tail_bucket: bool = True
+    chunk_size: int = 256
+    grad_accum_steps: int = 16
+    max_seq_len: int = 4096
     max_grad_norm: float = 1.0
     checkpoint_every_steps: int = 50
     eval_every_steps: int = 50
@@ -862,8 +870,9 @@ def _svd_init_lora(
     rank: int,
     alpha: float,
     max_norm: float = 1.0,
+    activation_scale: Any = None,
 ) -> None:
-    """Bounded SVD initialization of ``lora_A`` / ``lora_B`` from weight residual."""
+    """Bounded (optionally activation-weighted) SVD initialization of ``lora_A`` / ``lora_B``."""
     import math
     import torch
 
@@ -873,14 +882,26 @@ def _svd_init_lora(
         res_norm = float(torch.linalg.norm(residual).item())
         if res_norm == 0.0 or not math.isfinite(res_norm):
             return
-        u, s, vh = torch.linalg.svd(residual, full_matrices=False)
-        r = min(rank, int(s.shape[0]))
-        if r == 0:
-            return
         scale_factor = float(rank) / float(alpha)
-        s_sqrt = torch.sqrt(s[:r].clamp(min=0.0))
-        b_init = u[:, :r] * s_sqrt.unsqueeze(0)
-        a_init = s_sqrt.unsqueeze(1) * vh[:r, :] * scale_factor
+        if activation_scale is not None:
+            from .quant4 import initialization_activation_weighted_svd
+
+            a_raw, b_init = initialization_activation_weighted_svd(
+                residual, activation_scale.to(device=base_w.device), rank=rank
+            )
+            r = min(rank, int(a_raw.shape[0]))
+            if r == 0:
+                return
+            a_init = a_raw[:r, :] * scale_factor
+            b_init = b_init[:, :r]
+        else:
+            u, s, vh = torch.linalg.svd(residual, full_matrices=False)
+            r = min(rank, int(s.shape[0]))
+            if r == 0:
+                return
+            s_sqrt = torch.sqrt(s[:r].clamp(min=0.0))
+            b_init = u[:, :r] * s_sqrt.unsqueeze(0)
+            a_init = s_sqrt.unsqueeze(1) * vh[:r, :] * scale_factor
         # Bound residual norm to prevent oversized initial perturbation
         approx_norm = float(torch.linalg.norm((b_init @ a_init) * (float(alpha) / float(rank))).item())
         if max_norm > 0 and approx_norm > max_norm:
@@ -896,13 +917,19 @@ def configure_mixed_precision_recovery(
     *,
     config: MixedPrecisionRecoveryConfig | None = None,
     teacher_weights: dict[str, Any] | None = None,
+    activation_scales: dict[str, Any] | None = None,
+    teacher_model: Any | None = None,
 ) -> dict[str, Any]:
     """Configure ``QTEALinear`` and ``Protected4BitLinear`` modules for recovery.
 
     Freezes all non-recovery parameters (embeddings, norms, vision, lm_head) and
     keeps discrete ``ternary`` and ``qweight`` codes frozen while enabling
-    continuous QTEA scales (``group_alpha``, ``group_beta``, ``col_v``) and
-    rank-r low-rank adapters.
+    FP32 continuous QTEA scales (``group_alpha``, ``group_beta``, ``col_v``)
+    and FP32 rank-r low-rank adapters.
+
+    Supports streaming per-layer SVD initialization from ``teacher_model`` or
+    ``teacher_weights`` with optional ``activation_scales`` (L2QER-style)
+    without requiring a giant global dense weight dict.
 
     # Errors: raises RecoveryError if PyTorch is unavailable or no recovery
     modules are found on ``model``.
@@ -919,26 +946,45 @@ def configure_mixed_precision_recovery(
     for p in model.parameters():
         p.requires_grad_(False)
 
+    teacher_named = dict(teacher_model.named_modules()) if teacher_model is not None else {}
+    act_map = activation_scales or {}
+
+    def _resolve_teacher_weight(mod_name: str) -> Any | None:
+        if teacher_weights and f"{mod_name}.weight" in teacher_weights:
+            return teacher_weights[f"{mod_name}.weight"]
+        if mod_name in teacher_named and hasattr(teacher_named[mod_name], "weight"):
+            return teacher_named[mod_name].weight
+        return None
+
     qtea_count = 0
     int4_count = 0
     frozen_code_tensors: list[str] = []
 
     for name, mod in model.named_modules():
+        act_sc = act_map.get(name)
+        if act_sc is None:
+            for pfx in ("language_model.", "model."):
+                if name.startswith(pfx) and name[len(pfx):] in act_map:
+                    act_sc = act_map[name[len(pfx):]]
+                    break
         if isinstance(mod, QTEALinear):
             mod.enable_recovery_parameters(
                 train_scales=cfg.train_qtea_scales,
                 lora_rank=cfg.lora_rank,
                 lora_alpha=cfg.lora_alpha,
+                adapter_dtype=torch.float32,
             )
             qtea_count += 1
             frozen_code_tensors.append(f"{name}.ternary")
-            if teacher_weights and cfg.svd_init and f"{name}.weight" in teacher_weights:
+            t_w = _resolve_teacher_weight(name) if cfg.svd_init else None
+            if t_w is not None:
                 _svd_init_lora(
                     mod,
-                    teacher_weights[f"{name}.weight"],
+                    t_w,
                     rank=cfg.lora_rank,
                     alpha=cfg.lora_alpha,
                     max_norm=cfg.svd_init_max_norm,
+                    activation_scale=act_sc,
                 )
         elif Protected4BitLinear is not None and isinstance(mod, Protected4BitLinear):
             if cfg.lora_rank > 0:
@@ -949,17 +995,25 @@ def configure_mixed_precision_recovery(
                 )
             int4_count += 1
             frozen_code_tensors.append(f"{name}.qweight")
-            if teacher_weights and cfg.svd_init and f"{name}.weight" in teacher_weights:
+            t_w = _resolve_teacher_weight(name) if cfg.svd_init else None
+            if t_w is not None:
                 _svd_init_lora(
                     mod,
-                    teacher_weights[f"{name}.weight"],
+                    t_w,
                     rank=cfg.lora_rank,
                     alpha=cfg.lora_alpha,
                     max_norm=cfg.svd_init_max_norm,
+                    activation_scale=act_sc,
                 )
 
     if qtea_count == 0 and int4_count == 0:
         raise RecoveryError("No QTEALinear or Protected4BitLinear modules found for recovery")
+
+    for pname, p in model.named_parameters():
+        if p.requires_grad and p.dtype != torch.float32:
+            raise RecoveryError(
+                f"Trainable parameter {pname!r} has dtype {p.dtype}; ADV-12.1 requires float32"
+            )
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -972,30 +1026,154 @@ def configure_mixed_precision_recovery(
     }
 
 
+def _resolve_backbone_and_head(model: Any) -> tuple[Any | None, Any | None]:
+    """Return ``(backbone, lm_head)`` if ``backbone.forward`` is callable without ``lm_head``."""
+    import torch.nn as nn
+
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None:
+        return None, None
+    for attr in ("model", "language_model"):
+        cand = getattr(model, attr, None)
+        if cand is not None and isinstance(cand, nn.Module):
+            if type(cand).forward is not nn.Module.forward:
+                return cand, lm_head
+    return None, None
+
+
+def _get_hoisted_head_weights(lm_head: Any) -> tuple[Any, Any | None]:
+    """Hoist dense ``(weight, bias)`` from ``lm_head`` once per microbatch."""
+    if hasattr(lm_head, "effective_weight"):
+        w_head = lm_head.effective_weight()
+    elif hasattr(lm_head, "weight"):
+        w_head = lm_head.weight
+    else:
+        raise RecoveryError("lm_head must expose weight or effective_weight()")
+    bias_head = getattr(lm_head, "bias", None)
+    return w_head, bias_head
+
+
+def _obj3_kl_and_ce_chunk_sum(
+    logits_chunk: Any,
+    labels_chunk: Any | None,
+    *,
+    top_probs_c: Any | None = None,
+    top_idx_c: Any | None = None,
+    tail_mass_c: Any | None = None,
+    log_p_tail_c: Any | None = None,
+    full_t_logits_c: Any | None = None,
+    legacy_top_k_logits_c: Any | None = None,
+    temperature: float = 1.0,
+    ce_weight: float = 0.0,
+    lambda_kl: float = 1.0,
+    tail_threshold: float = 1e-12,
+    topk_tail_bucket: bool = True,
+) -> tuple[Any, Any]:
+    """Compute exact summed Obj-3 (top-K + tail-bucket) KL and CE over one token chunk."""
+    import torch
+    import torch.nn.functional as F
+
+    z = logits_chunk.float()
+    zero = z.sum() * 0.0
+    l_ce_sum = zero
+    if ce_weight > 0.0 and labels_chunk is not None:
+        l_ce_sum = F.cross_entropy(z, labels_chunk.to(device=z.device, dtype=torch.long), reduction="sum")
+
+    l_kl_sum = zero
+    if lambda_kl <= 0.0:
+        return l_ce_sum, l_kl_sum
+
+    t = float(temperature)
+    z_t = z / t
+
+    if top_probs_c is not None and top_idx_c is not None:
+        dev = z_t.device
+        p_top = top_probs_c.to(device=dev, dtype=torch.float32)
+        idx = top_idx_c.to(device=dev, dtype=torch.long)
+        log_z_all = torch.logsumexp(z_t, dim=-1)
+        z_top = torch.gather(z_t, dim=-1, index=idx)
+        log_q_top = z_top - log_z_all.unsqueeze(-1)
+        p_safe = p_top.clamp(min=1e-30)
+        kl_top_terms = torch.where(p_top > 0.0, p_top * (torch.log(p_safe) - log_q_top), torch.zeros_like(p_top))
+        kl_tokens = kl_top_terms.sum(dim=-1)
+
+        if topk_tail_bucket and idx.shape[-1] < z_t.shape[-1]:
+            p_tail = (
+                tail_mass_c.to(device=dev, dtype=torch.float32)
+                if tail_mass_c is not None
+                else (1.0 - p_top.sum(dim=-1)).clamp(min=0.0)
+            )
+            active = p_tail > tail_threshold
+            if bool(active.any()):
+                z_masked = z_t[active].scatter(-1, idx[active], float("-inf"))
+                log_z_tail = torch.logsumexp(z_masked, dim=-1)
+                log_q_tail = log_z_tail - log_z_all[active]
+                log_pt = (
+                    log_p_tail_c.to(device=dev, dtype=torch.float32)[active]
+                    if log_p_tail_c is not None
+                    else torch.log(p_tail[active].clamp(min=1e-30))
+                )
+                kl_tail_active = p_tail[active] * (log_pt - log_q_tail)
+                kl_tokens = kl_tokens.clone()
+                kl_tokens[active] = kl_tokens[active] + kl_tail_active
+
+        l_kl_sum = kl_tokens.sum() * (t * t)
+    elif legacy_top_k_logits_c is not None and top_idx_c is not None:
+        dev = z_t.device
+        t_vals = legacy_top_k_logits_c.to(device=dev, dtype=torch.float32)
+        idx = top_idx_c.to(device=dev, dtype=torch.long)
+        log_z_all = torch.logsumexp(z_t, dim=-1)
+        z_top = torch.gather(z_t, dim=-1, index=idx)
+        p_top = F.softmax(t_vals / t, dim=-1)
+        log_q_top = z_top - log_z_all.unsqueeze(-1)
+        l_kl_sum = F.kl_div(log_q_top, p_top, reduction="sum") * (t * t)
+    elif full_t_logits_c is not None:
+        t_probs = F.softmax(full_t_logits_c.to(device=z_t.device, dtype=torch.float32) / t, dim=-1)
+        s_log_probs = F.log_softmax(z_t, dim=-1)
+        l_kl_sum = F.kl_div(s_log_probs, t_probs, reduction="sum") * (t * t)
+
+    return l_ce_sum, l_kl_sum
+
+
 def capture_teacher_targets(
     teacher_model: Any,
     batches: list[dict[str, Any]],
     *,
-    top_k: int | None = 64,
+    top_k: int | None = 128,
+    temperature: float = 1.0,
+    chunk_size: int = 256,
     offload_to_cpu: bool = True,
     hidden_layer_indices: tuple[int, ...] | list[int] | None = None,
 ) -> TeacherTargetCache:
-    """Capture teacher logits (full or top-k) and optional hidden states.
+    """Capture teacher full-softmax top-K probs (FP16), int32 indices, and tail mass.
 
-    Supports freeing the BF16 teacher from GPU memory before student recovery
-    runs when ``offload_to_cpu=True``.
+    Computes the exact denominator ``logsumexp`` over the entire vocabulary
+    chunk-by-chunk (256 tokens by default), stores ``top_k_probs`` in FP16
+    (unrenormalized full-softmax probabilities at ``temperature``),
+    ``top_k_indices`` in ``int32`` (safe for vocabularies > 65,535),
+    ``retained_mass`` and ``log_p_tail`` in FP32, and marks ``truncated_kl=True``
+    when ``top_k`` is bounded.
 
     # Errors: raises RecoveryError if PyTorch is unavailable or teacher forward
-    returns no logits.
+    returns no logits/hidden states.
     """
     try:
         import torch
+        import torch.nn.functional as F
     except ImportError as exc:
         raise RecoveryError("PyTorch is required for capture_teacher_targets") from exc
 
     teacher_model.eval()
     entries: list[dict[str, Any]] = []
     target_device = torch.device("cpu") if offload_to_cpu else None
+    t = float(temperature)
+    backbone, lm_head = _resolve_backbone_and_head(teacher_model)
+    w_head = None
+    bias_head = None
+    if backbone is not None and lm_head is not None:
+        w_head, bias_head = _get_hoisted_head_weights(lm_head)
+
+    retained_means: list[float] = []
 
     with torch.no_grad():
         for batch in batches:
@@ -1007,27 +1185,77 @@ def capture_teacher_targets(
             if hidden_layer_indices is not None:
                 fwd_kwargs["output_hidden_states"] = True
 
-            try:
-                out = teacher_model(**fwd_kwargs)
-            except TypeError:
-                # Minimal synthetic models may not accept output_hidden_states
-                fwd_kwargs.pop("output_hidden_states", None)
-                out = teacher_model(**fwd_kwargs)
+            logits = None
+            hidden_states = None
+            last_hidden = None
 
-            logits = getattr(out, "logits", out[0] if isinstance(out, tuple) else out)
-            if logits is None:
-                raise RecoveryError("Teacher model returned no logits")
-
-            entry: dict[str, Any] = {}
-            if top_k is not None and 0 < top_k < logits.shape[-1]:
-                vals, idx = torch.topk(logits.float(), k=top_k, dim=-1)
-                entry["top_k_logits"] = vals.to(device=target_device) if target_device else vals
-                entry["top_k_indices"] = idx.to(device=target_device) if target_device else idx
+            if backbone is not None and w_head is not None:
+                try:
+                    b_out = backbone(**fwd_kwargs)
+                except TypeError:
+                    fwd_kwargs.pop("output_hidden_states", None)
+                    b_out = backbone(**fwd_kwargs)
+                last_hidden = getattr(b_out, "last_hidden_state", b_out[0] if isinstance(b_out, tuple) else b_out)
+                hidden_states = getattr(b_out, "hidden_states", None)
+                bsz, seqlen, _ = last_hidden.shape
+                vocab_size = int(w_head.shape[0])
             else:
+                try:
+                    out = teacher_model(**fwd_kwargs)
+                except TypeError:
+                    fwd_kwargs.pop("output_hidden_states", None)
+                    out = teacher_model(**fwd_kwargs)
+                logits = getattr(out, "logits", out[0] if isinstance(out, tuple) else out)
+                if logits is None:
+                    raise RecoveryError("Teacher model returned no logits")
+                hidden_states = getattr(out, "hidden_states", None)
+                bsz, seqlen, vocab_size = logits.shape
+
+            entry: dict[str, Any] = {"temperature": t}
+            if top_k is not None and 0 < top_k < vocab_size:
+                idx_chunks: list[Any] = []
+                prob_chunks: list[Any] = []
+                ret_chunks: list[Any] = []
+                log_tail_chunks: list[Any] = []
+                step_c = max(1, int(chunk_size))
+                for s0 in range(0, seqlen, step_c):
+                    s1 = min(seqlen, s0 + step_c)
+                    if logits is not None:
+                        z_c = logits[:, s0:s1, :].float() / t
+                    else:
+                        h_c = last_hidden[:, s0:s1, :]
+                        z_c = F.linear(h_c.to(w_head.dtype), w_head, bias_head).float() / t
+                    log_z = torch.logsumexp(z_c, dim=-1, keepdim=True)
+                    vals_c, idx_c = torch.topk(z_c, k=top_k, dim=-1)
+                    probs_c = torch.exp(vals_c - log_z)
+                    ret_c = probs_c.sum(dim=-1).clamp(min=0.0, max=1.0)
+                    tail_c = (1.0 - ret_c).clamp(min=0.0)
+                    log_pt_c = torch.log(tail_c.clamp(min=1e-30))
+                    idx_chunks.append(idx_c.to(torch.int32))
+                    prob_chunks.append(probs_c.to(torch.float16))
+                    ret_chunks.append(ret_c.to(torch.float32))
+                    log_tail_chunks.append(log_pt_c.to(torch.float32))
+                    del z_c, log_z, vals_c
+
+                all_idx = torch.cat(idx_chunks, dim=1)
+                all_probs = torch.cat(prob_chunks, dim=1)
+                all_ret = torch.cat(ret_chunks, dim=1)
+                all_log_tail = torch.cat(log_tail_chunks, dim=1)
+                retained_means.append(float(all_ret.mean().item()))
+                entry["top_k_indices"] = all_idx.to(device=target_device) if target_device else all_idx
+                entry["top_k_probs"] = all_probs.to(device=target_device) if target_device else all_probs
+                entry["retained_mass"] = all_ret.to(device=target_device) if target_device else all_ret
+                entry["log_p_tail"] = all_log_tail.to(device=target_device) if target_device else all_log_tail
+                entry["truncated_kl"] = True
+            else:
+                if logits is None:
+                    h_flat = last_hidden.reshape(-1, last_hidden.shape[-1])
+                    logits = F.linear(h_flat.to(w_head.dtype), w_head, bias_head).reshape(bsz, seqlen, vocab_size)
                 l_store = logits.float()
                 entry["logits"] = l_store.to(device=target_device) if target_device else l_store
+                entry["retained_mass"] = torch.ones((bsz, seqlen), dtype=torch.float32, device=target_device or l_store.device)
+                entry["truncated_kl"] = False
 
-            hidden_states = getattr(out, "hidden_states", None)
             if hidden_layer_indices is not None and hidden_states is not None:
                 selected = {}
                 for li in hidden_layer_indices:
@@ -1038,8 +1266,9 @@ def capture_teacher_targets(
             entries.append(entry)
 
     truncated = top_k is not None
+    mean_ret = sum(retained_means) / len(retained_means) if retained_means else 1.0
     note = (
-        f"Top-{top_k} truncated KL omits tail probability mass outside top-{top_k} teacher logits"
+        f"Top-{top_k} tail-bucket Obj-3 KL (retained_mass={mean_ret:.4f}, tail_mass={max(0.0, 1.0 - mean_ret):.4f})"
         if truncated
         else "Full-vocabulary KL divergence (no tail mass omitted)"
     )
@@ -1052,20 +1281,190 @@ def capture_teacher_targets(
     )
 
 
+def compute_fused_chunked_kl_loss(
+    hidden_states: Any,
+    lm_head: Any,
+    labels: Any,
+    *,
+    teacher_target: dict[str, Any] | None = None,
+    student_hidden_states: Any = None,
+    ce_weight: float = 0.0,
+    lambda_kl: float = 1.0,
+    mu_hidden: float = 0.1,
+    temperature: float = 1.0,
+    chunk_size: int = 256,
+    tail_threshold: float = 1e-12,
+    topk_tail_bucket: bool = True,
+) -> tuple[Any, dict[str, float]]:
+    """Compute Obj-3 top-K + tail-bucket KL (plus optional CE/hidden) without full (B,S,V) logits.
+
+    Takes backbone ``hidden_states`` and ``lm_head`` directly, hoists dense or
+    INT8-dequantized ``lm_head`` weights once per microbatch, and processes only
+    supervised positions (``labels[:, 1:] != -100``) in gradient-checkpointed
+    chunks of ``chunk_size`` tokens (default 256).
+
+    # Errors: raises RecoveryError if PyTorch is unavailable or tensor shapes
+    are invalid.
+    """
+    try:
+        import torch
+        import torch.nn.functional as F
+        from torch.utils.checkpoint import checkpoint
+    except ImportError as exc:
+        raise RecoveryError("PyTorch is required for compute_fused_chunked_kl_loss") from exc
+
+    if hidden_states.ndim != 3 or labels.ndim != 2:
+        raise RecoveryError(
+            f"Expected 3D hidden_states and 2D labels, got {tuple(hidden_states.shape)} and {tuple(labels.shape)}"
+        )
+
+    shift_h = hidden_states[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    sup_mask = shift_labels != -100
+    n_sup = int(sup_mask.sum().item())
+
+    if n_sup == 0:
+        zero = shift_h.sum() * 0.0
+        return zero, {
+            "loss": 0.0,
+            "l_ce": 0.0,
+            "l_kl": 0.0,
+            "l_hidden": 0.0,
+            "supervised_tokens": 0,
+        }
+
+    h_sup = shift_h[sup_mask]
+    y_sup = shift_labels[sup_mask]
+    w_head, bias_head = _get_hoisted_head_weights(lm_head)
+
+    t_probs_all = None
+    t_idx_all = None
+    t_tail_all = None
+    t_log_pt_all = None
+    t_legacy_logits_all = None
+    t_full_logits_all = None
+
+    if teacher_target is not None and lambda_kl > 0.0:
+        if "top_k_probs" in teacher_target and "top_k_indices" in teacher_target:
+            t_probs_all = teacher_target["top_k_probs"][:, :-1, :][sup_mask]
+            t_idx_all = teacher_target["top_k_indices"][:, :-1, :][sup_mask]
+            if "retained_mass" in teacher_target:
+                t_tail_all = (1.0 - teacher_target["retained_mass"][:, :-1][sup_mask].float()).clamp(min=0.0)
+            if "log_p_tail" in teacher_target:
+                t_log_pt_all = teacher_target["log_p_tail"][:, :-1][sup_mask]
+        elif "top_k_logits" in teacher_target and "top_k_indices" in teacher_target:
+            t_legacy_logits_all = teacher_target["top_k_logits"][:, :-1, :][sup_mask]
+            t_idx_all = teacher_target["top_k_indices"][:, :-1, :][sup_mask]
+        elif "logits" in teacher_target:
+            t_full_logits_all = teacher_target["logits"][:, :-1, :][sup_mask]
+
+    step_c = max(1, int(chunk_size))
+    ce_sum_total = h_sup.sum() * 0.0
+    kl_sum_total = h_sup.sum() * 0.0
+    use_ckpt = bool(torch.is_grad_enabled() and h_sup.requires_grad)
+
+    def _make_chunk_runner(
+        y_arg: Any,
+        tp_arg: Any,
+        ti_arg: Any,
+        tm_arg: Any,
+        lp_arg: Any,
+        leg_arg: Any,
+        full_arg: Any,
+    ) -> Any:
+        def _run_chunk(h_arg: Any, w_arg: Any, b_arg: Any | None = None) -> tuple[Any, Any]:
+            z_c = F.linear(h_arg.to(w_arg.dtype), w_arg, b_arg)
+            return _obj3_kl_and_ce_chunk_sum(
+                z_c,
+                y_arg,
+                top_probs_c=tp_arg,
+                top_idx_c=ti_arg,
+                tail_mass_c=tm_arg,
+                log_p_tail_c=lp_arg,
+                full_t_logits_c=full_arg,
+                legacy_top_k_logits_c=leg_arg,
+                temperature=temperature,
+                ce_weight=ce_weight,
+                lambda_kl=lambda_kl,
+                tail_threshold=tail_threshold,
+                topk_tail_bucket=topk_tail_bucket,
+            )
+
+        return _run_chunk
+
+    for start in range(0, n_sup, step_c):
+        end = min(n_sup, start + step_c)
+        h_c = h_sup[start:end]
+        chunk_fn = _make_chunk_runner(
+            y_sup[start:end],
+            t_probs_all[start:end] if t_probs_all is not None else None,
+            t_idx_all[start:end] if t_idx_all is not None else None,
+            t_tail_all[start:end] if t_tail_all is not None else None,
+            t_log_pt_all[start:end] if t_log_pt_all is not None else None,
+            t_legacy_logits_all[start:end] if t_legacy_logits_all is not None else None,
+            t_full_logits_all[start:end] if t_full_logits_all is not None else None,
+        )
+
+        if use_ckpt:
+            if bias_head is not None:
+                c_ce, c_kl = checkpoint(chunk_fn, h_c, w_head, bias_head, use_reentrant=False)
+            else:
+                c_ce, c_kl = checkpoint(chunk_fn, h_c, w_head, use_reentrant=False)
+        else:
+            c_ce, c_kl = chunk_fn(h_c, w_head, bias_head)
+        ce_sum_total = ce_sum_total + c_ce
+        kl_sum_total = kl_sum_total + c_kl
+
+    inv_n = 1.0 / float(n_sup)
+    l_ce = ce_sum_total * inv_n
+    l_kl = kl_sum_total * inv_n
+
+    l_hidden = shift_h.sum() * 0.0
+    if (
+        teacher_target is not None
+        and "hidden_states" in teacher_target
+        and student_hidden_states is not None
+        and mu_hidden > 0.0
+    ):
+        t_hmap = teacher_target["hidden_states"]
+        losses_h = []
+        for li, t_h in t_hmap.items():
+            if -len(student_hidden_states) <= li < len(student_hidden_states):
+                s_h = student_hidden_states[li][:, :-1, :].float()
+                t_h_shift = t_h[:, :-1, :].to(device=s_h.device, dtype=torch.float32)
+                losses_h.append(F.mse_loss(s_h[sup_mask], t_h_shift[sup_mask]))
+        if losses_h:
+            l_hidden = torch.stack(losses_h).mean()
+
+    total = float(ce_weight) * l_ce + float(lambda_kl) * l_kl + float(mu_hidden) * l_hidden
+    metrics = {
+        "loss": float(total.detach().item()),
+        "l_ce": float(l_ce.detach().item()),
+        "l_kl": float(l_kl.detach().item()),
+        "l_hidden": float(l_hidden.detach().item()),
+        "supervised_tokens": n_sup,
+    }
+    return total, metrics
+
+
 def compute_recovery_loss(
     student_logits: Any,
     labels: Any,
     *,
     teacher_target: dict[str, Any] | None = None,
     student_hidden_states: Any = None,
+    ce_weight: float = 1.0,
     lambda_kl: float = 1.0,
     mu_hidden: float = 0.1,
-    temperature: float = 2.0,
+    temperature: float = 1.0,
+    chunk_size: int = 256,
+    tail_threshold: float = 1e-12,
+    topk_tail_bucket: bool = True,
 ) -> tuple[Any, dict[str, float]]:
-    """Compute ``L = L_CE + lambda * L_KL + mu * L_hidden`` with causal shift.
+    """Compute ``L = ce_weight * L_CE + lambda * L_KL + mu * L_hidden`` with causal shift.
 
-    Uses exact causal shift (``logits[:, :-1]`` vs ``labels[:, 1:]``) and
-    masks unsupervised positions (``labels == -100``).
+    Uses the unified Obj-3 chunked top-K + tail-bucket KL implementation over
+    supervised positions (``labels[:, 1:] != -100``).
 
     # Errors: raises RecoveryError if PyTorch is unavailable or shapes are invalid.
     """
@@ -1080,32 +1479,61 @@ def compute_recovery_loss(
             f"Expected 3D logits and 2D labels, got {tuple(student_logits.shape)} and {tuple(labels.shape)}"
         )
 
-    shift_logits = student_logits[:, :-1, :].float()
+    shift_logits = student_logits[:, :-1, :]
     shift_labels = labels[:, 1:]
     sup_mask = shift_labels != -100
     n_sup = int(sup_mask.sum().item())
 
-    if n_sup > 0:
-        l_ce = F.cross_entropy(shift_logits[sup_mask], shift_labels[sup_mask], reduction="mean")
-    else:
-        l_ce = shift_logits.sum() * 0.0
-
+    l_ce = shift_logits.sum() * 0.0
     l_kl = shift_logits.sum() * 0.0
-    if teacher_target is not None and lambda_kl > 0.0 and n_sup > 0:
-        t = float(temperature)
-        dev = shift_logits.device
-        if "top_k_logits" in teacher_target and "top_k_indices" in teacher_target:
-            t_vals = teacher_target["top_k_logits"][:, :-1, :].to(device=dev, dtype=torch.float32)[sup_mask]
-            t_idx = teacher_target["top_k_indices"][:, :-1, :].to(device=dev, dtype=torch.long)[sup_mask]
-            s_sel = torch.gather(shift_logits[sup_mask], dim=-1, index=t_idx)
-            t_probs = F.softmax(t_vals / t, dim=-1)
-            s_log_probs = F.log_softmax(s_sel / t, dim=-1)
-            l_kl = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (t * t)
-        elif "logits" in teacher_target:
-            t_logits = teacher_target["logits"][:, :-1, :].to(device=dev, dtype=torch.float32)[sup_mask]
-            t_probs = F.softmax(t_logits / t, dim=-1)
-            s_log_probs = F.log_softmax(shift_logits[sup_mask] / t, dim=-1)
-            l_kl = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (t * t)
+    if n_sup > 0:
+        z_sup = shift_logits[sup_mask]
+        y_sup = shift_labels[sup_mask]
+        t_probs_all = None
+        t_idx_all = None
+        t_tail_all = None
+        t_log_pt_all = None
+        t_legacy_all = None
+        t_full_all = None
+        if teacher_target is not None and lambda_kl > 0.0:
+            if "top_k_probs" in teacher_target and "top_k_indices" in teacher_target:
+                t_probs_all = teacher_target["top_k_probs"][:, :-1, :][sup_mask]
+                t_idx_all = teacher_target["top_k_indices"][:, :-1, :][sup_mask]
+                if "retained_mass" in teacher_target:
+                    t_tail_all = (1.0 - teacher_target["retained_mass"][:, :-1][sup_mask].float()).clamp(min=0.0)
+                if "log_p_tail" in teacher_target:
+                    t_log_pt_all = teacher_target["log_p_tail"][:, :-1][sup_mask]
+            elif "top_k_logits" in teacher_target and "top_k_indices" in teacher_target:
+                t_legacy_all = teacher_target["top_k_logits"][:, :-1, :][sup_mask]
+                t_idx_all = teacher_target["top_k_indices"][:, :-1, :][sup_mask]
+            elif "logits" in teacher_target:
+                t_full_all = teacher_target["logits"][:, :-1, :][sup_mask]
+
+        step_c = max(1, int(chunk_size))
+        ce_sum = z_sup.sum() * 0.0
+        kl_sum = z_sup.sum() * 0.0
+        for start in range(0, n_sup, step_c):
+            end = min(n_sup, start + step_c)
+            c_ce, c_kl = _obj3_kl_and_ce_chunk_sum(
+                z_sup[start:end],
+                y_sup[start:end],
+                top_probs_c=t_probs_all[start:end] if t_probs_all is not None else None,
+                top_idx_c=t_idx_all[start:end] if t_idx_all is not None else None,
+                tail_mass_c=t_tail_all[start:end] if t_tail_all is not None else None,
+                log_p_tail_c=t_log_pt_all[start:end] if t_log_pt_all is not None else None,
+                full_t_logits_c=t_full_all[start:end] if t_full_all is not None else None,
+                legacy_top_k_logits_c=t_legacy_all[start:end] if t_legacy_all is not None else None,
+                temperature=temperature,
+                ce_weight=ce_weight,
+                lambda_kl=lambda_kl,
+                tail_threshold=tail_threshold,
+                topk_tail_bucket=topk_tail_bucket,
+            )
+            ce_sum = ce_sum + c_ce
+            kl_sum = kl_sum + c_kl
+        inv_n = 1.0 / float(n_sup)
+        l_ce = ce_sum * inv_n
+        l_kl = kl_sum * inv_n
 
     l_hidden = shift_logits.sum() * 0.0
     if (
@@ -1127,7 +1555,7 @@ def compute_recovery_loss(
         if losses_h:
             l_hidden = torch.stack(losses_h).mean()
 
-    total = l_ce + float(lambda_kl) * l_kl + float(mu_hidden) * l_hidden
+    total = float(ce_weight) * l_ce + float(lambda_kl) * l_kl + float(mu_hidden) * l_hidden
     metrics = {
         "loss": float(total.detach().item()),
         "l_ce": float(l_ce.detach().item()),
@@ -1178,7 +1606,7 @@ def _extract_trainable_state(model: Any) -> dict[str, Any]:
         for k, v in model.state_dict().items()
         if any(
             k.endswith(suffix)
-            for suffix in (".group_alpha", ".group_beta", ".col_v", ".lora_A", ".lora_B", ".scales", ".zeros")
+            for suffix in (".group_alpha", ".group_beta", ".col_v", ".lora_A", ".lora_B")
         )
     }
 
@@ -1192,6 +1620,126 @@ def _atomic_torch_save(obj: dict[str, Any], path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _forward_recovery_step(
+    model: Any,
+    batch: dict[str, Any],
+    t_entry: dict[str, Any] | None,
+    cfg: MixedPrecisionRecoveryConfig,
+    *,
+    backbone: Any | None = None,
+    lm_head: Any | None = None,
+) -> tuple[Any, dict[str, float]]:
+    fwd_kwargs: dict[str, Any] = {"input_ids": batch["input_ids"]}
+    if "attention_mask" in batch:
+        fwd_kwargs["attention_mask"] = batch["attention_mask"]
+    if cfg.mu_hidden > 0.0:
+        fwd_kwargs["output_hidden_states"] = True
+
+    if backbone is not None and lm_head is not None:
+        try:
+            b_out = backbone(**fwd_kwargs)
+        except TypeError:
+            fwd_kwargs.pop("output_hidden_states", None)
+            b_out = backbone(**fwd_kwargs)
+        last_hidden = getattr(b_out, "last_hidden_state", b_out[0] if isinstance(b_out, tuple) else b_out)
+        hidden = getattr(b_out, "hidden_states", None)
+        return compute_fused_chunked_kl_loss(
+            last_hidden,
+            lm_head,
+            batch["labels"],
+            teacher_target=t_entry,
+            student_hidden_states=hidden,
+            ce_weight=cfg.ce_weight,
+            lambda_kl=cfg.lambda_kl,
+            mu_hidden=cfg.mu_hidden,
+            temperature=cfg.temperature,
+            chunk_size=cfg.chunk_size,
+            topk_tail_bucket=cfg.topk_tail_bucket,
+        )
+
+    try:
+        out = model(**fwd_kwargs)
+    except TypeError:
+        fwd_kwargs.pop("output_hidden_states", None)
+        out = model(**fwd_kwargs)
+    logits = getattr(out, "logits", out[0] if isinstance(out, tuple) else out)
+    hidden = getattr(out, "hidden_states", None)
+    return compute_recovery_loss(
+        logits,
+        batch["labels"],
+        teacher_target=t_entry,
+        student_hidden_states=hidden,
+        ce_weight=cfg.ce_weight,
+        lambda_kl=cfg.lambda_kl,
+        mu_hidden=cfg.mu_hidden,
+        temperature=cfg.temperature,
+        chunk_size=cfg.chunk_size,
+        topk_tail_bucket=cfg.topk_tail_bucket,
+    )
+
+
+def _split_recovery_param_groups(
+    model: Any, cfg: MixedPrecisionRecoveryConfig
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    eff_adapter_lr = float(cfg.lr if cfg.lr is not None else cfg.adapter_lr)
+    eff_scale_lr = float(cfg.scale_lr)
+    adapter_params: list[Any] = []
+    scale_params: list[Any] = []
+    for pname, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if pname.endswith((".lora_A", ".lora_B")):
+            adapter_params.append(param)
+        else:
+            scale_params.append(param)
+    groups: list[dict[str, Any]] = []
+    if adapter_params:
+        groups.append(
+            {
+                "name": "adapters",
+                "params": adapter_params,
+                "lr": eff_adapter_lr,
+                "weight_decay": float(cfg.weight_decay),
+            }
+        )
+    if scale_params:
+        groups.append(
+            {
+                "name": "scales",
+                "params": scale_params,
+                "lr": eff_scale_lr,
+                "weight_decay": float(cfg.weight_decay),
+            }
+        )
+    trainable = adapter_params + scale_params
+    return groups, trainable
+
+
+def _build_warmup_cosine_scheduler(
+    optimizer: Any,
+    *,
+    total_optim_steps: int,
+    warmup_ratio: float,
+    scheduler_type: str = "cosine",
+) -> Any:
+    import math
+    import torch
+
+    total_opt = max(1, int(total_optim_steps))
+    warmup_steps = int(round(max(0.0, float(warmup_ratio)) * total_opt))
+
+    def _lr_lambda(opt_step: int) -> float:
+        if warmup_steps > 0 and opt_step < warmup_steps:
+            return float(opt_step + 1) / float(warmup_steps)
+        if scheduler_type == "constant":
+            return 1.0
+        denom = max(1, total_opt - warmup_steps)
+        progress = min(1.0, max(0.0, float(opt_step - warmup_steps) / float(denom)))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
+
 def _eval_heldout_loss(
     model: Any,
     eval_batches: list[dict[str, Any]],
@@ -1203,30 +1751,22 @@ def _eval_heldout_loss(
 
     was_training = model.training
     model.eval()
+    backbone, lm_head = _resolve_backbone_and_head(model)
     losses: list[float] = []
     with torch.no_grad():
         for idx, batch in enumerate(eval_batches):
-            fwd_kwargs: dict[str, Any] = {"input_ids": batch["input_ids"]}
-            if "attention_mask" in batch:
-                fwd_kwargs["attention_mask"] = batch["attention_mask"]
-            if cfg.mu_hidden > 0.0:
-                fwd_kwargs["output_hidden_states"] = True
-            try:
-                out = model(**fwd_kwargs)
-            except TypeError:
-                fwd_kwargs.pop("output_hidden_states", None)
-                out = model(**fwd_kwargs)
-            logits = getattr(out, "logits", out[0] if isinstance(out, tuple) else out)
-            hidden = getattr(out, "hidden_states", None)
-            t_entry = eval_teacher_cache.entries[idx] if eval_teacher_cache and idx < len(eval_teacher_cache.entries) else None
-            loss, _ = compute_recovery_loss(
-                logits,
-                batch["labels"],
-                teacher_target=t_entry,
-                student_hidden_states=hidden,
-                lambda_kl=cfg.lambda_kl,
-                mu_hidden=cfg.mu_hidden,
-                temperature=cfg.temperature,
+            t_entry = (
+                eval_teacher_cache.entries[idx]
+                if eval_teacher_cache and idx < len(eval_teacher_cache.entries)
+                else None
+            )
+            loss, _ = _forward_recovery_step(
+                model,
+                batch,
+                t_entry,
+                cfg,
+                backbone=backbone,
+                lm_head=lm_head,
             )
             losses.append(float(loss.item()))
     if was_training:
@@ -1249,9 +1789,11 @@ def train_mixed_precision_recovery(
 ) -> dict[str, Any]:
     """Run teacher-guided mixed-precision recovery with atomic checkpointing & rollback.
 
-    Supports resuming from ``run_dir/recovery_state/latest.pt`` (validating
-    config & source identity fingerprint) and restoring the best held-out
-    checkpoint ``best.pt`` when final evaluation degrades.
+    Uses dual optimizer LR groups (``adapter_lr=5e-5`` / ``scale_lr=5e-6`` by
+    default), linear warmup + cosine decay scheduling, fused chunked Obj-3
+    recovery loss when backbone and ``lm_head`` are exposed cleanly, persists full
+    training/scheduler/RNG/cursor state, verifies frozen quantized codes on
+    exit, and restores ``model.eval()``.
 
     # Errors: raises RecoveryError on non-finite loss/gradients, frozen code
     mutation, or incompatible checkpoint resume metadata.
@@ -1264,13 +1806,31 @@ def train_mixed_precision_recovery(
     import math as _math
 
     cfg = config or MixedPrecisionRecoveryConfig()
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    param_groups, trainable = _split_recovery_param_groups(model, cfg)
     if not trainable:
         raise RecoveryError("No trainable recovery parameters found; call configure_mixed_precision_recovery first")
+    for p in trainable:
+        if p.dtype != torch.float32:
+            raise RecoveryError(f"Trainable recovery parameter dtype must be float32, got {p.dtype}")
+
+    total_batches = len(train_batches)
+    if total_batches == 0:
+        raise RecoveryError("train_batches must not be empty")
+
+    target_steps = max_steps if max_steps is not None else total_batches
+    accum = max(1, int(cfg.grad_accum_steps))
+    total_optim_steps = max(1, _math.ceil(target_steps / accum))
 
     frozen_snap = _snapshot_frozen_codes(model)
-    optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups)
+    scheduler = _build_warmup_cosine_scheduler(
+        optimizer,
+        total_optim_steps=total_optim_steps,
+        warmup_ratio=cfg.warmup_ratio,
+        scheduler_type=cfg.lr_scheduler_type,
+    )
     fingerprint = _recovery_config_fingerprint(cfg)
+    backbone, lm_head = _resolve_backbone_and_head(model)
 
     ckpt_dir = Path(run_dir).resolve() / "recovery_state" if run_dir is not None else None
     latest_path = ckpt_dir / "latest.pt" if ckpt_dir is not None else None
@@ -1281,6 +1841,7 @@ def train_mixed_precision_recovery(
     best_eval_loss = float("inf")
     eval_history: list[dict[str, Any]] = []
     history: list[dict[str, float]] = []
+    batch_cursor = 0
 
     if resume and latest_path is not None and latest_path.is_file():
         ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
@@ -1290,127 +1851,119 @@ def train_mixed_precision_recovery(
             )
         model.load_state_dict(ckpt["trainable_state_dict"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if "rng_state" in ckpt:
             torch.set_rng_state(ckpt["rng_state"])
         start_step = int(ckpt["step"])
         tokens_consumed = int(ckpt["tokens_consumed"])
         best_eval_loss = float(ckpt.get("best_eval_loss", float("inf")))
         eval_history = list(ckpt.get("eval_history", []))
-
-    model.train()
-    optimizer.zero_grad()
-
-    total_batches = len(train_batches)
-    if total_batches == 0:
-        raise RecoveryError("train_batches must not be empty")
+        batch_cursor = int(ckpt.get("batch_cursor", start_step % total_batches))
 
     step = start_step
-    target_steps = max_steps if max_steps is not None else total_batches
-    batch_cursor = start_step % total_batches
+    try:
+        model.train()
+        optimizer.zero_grad()
 
-    while step < target_steps and tokens_consumed < cfg.supervised_token_budget:
-        batch = train_batches[batch_cursor]
-        t_entry = (
-            teacher_cache.entries[batch_cursor]
-            if teacher_cache is not None and batch_cursor < len(teacher_cache.entries)
-            else None
-        )
-
-        fwd_kwargs: dict[str, Any] = {"input_ids": batch["input_ids"]}
-        if "attention_mask" in batch:
-            fwd_kwargs["attention_mask"] = batch["attention_mask"]
-        if cfg.mu_hidden > 0.0:
-            fwd_kwargs["output_hidden_states"] = True
-        try:
-            out = model(**fwd_kwargs)
-        except TypeError:
-            fwd_kwargs.pop("output_hidden_states", None)
-            out = model(**fwd_kwargs)
-
-        logits = getattr(out, "logits", out[0] if isinstance(out, tuple) else out)
-        hidden = getattr(out, "hidden_states", None)
-        loss, metrics = compute_recovery_loss(
-            logits,
-            batch["labels"],
-            teacher_target=t_entry,
-            student_hidden_states=hidden,
-            lambda_kl=cfg.lambda_kl,
-            mu_hidden=cfg.mu_hidden,
-            temperature=cfg.temperature,
-        )
-        if not _math.isfinite(metrics["loss"]):
-            raise RecoveryError(f"Non-finite recovery loss at step {step}: {metrics['loss']}")
-
-        scaled_loss = loss / float(max(1, cfg.grad_accum_steps))
-        scaled_loss.backward()
-
-        step += 1
-        batch_cursor = (batch_cursor + 1) % total_batches
-        tokens_consumed += int(metrics["supervised_tokens"])
-        history.append({"step": float(step), **metrics})
-
-        if step % max(1, cfg.grad_accum_steps) == 0 or step >= target_steps:
-            for p in trainable:
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    raise RecoveryError(f"Non-finite gradient detected at step {step}")
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
-
-        if eval_batches and (step % max(1, cfg.eval_every_steps) == 0 or step >= target_steps):
-            ev_loss = _eval_heldout_loss(
-                model,
-                eval_batches,
-                eval_teacher_cache=eval_teacher_cache,
-                cfg=cfg,
+        while step < target_steps and tokens_consumed < cfg.supervised_token_budget:
+            batch = train_batches[batch_cursor]
+            t_entry = (
+                teacher_cache.entries[batch_cursor]
+                if teacher_cache is not None and batch_cursor < len(teacher_cache.entries)
+                else None
             )
-            eval_history.append({"step": step, "eval_loss": ev_loss, "tokens": tokens_consumed})
-            if best_path is not None and ev_loss < best_eval_loss:
-                best_eval_loss = ev_loss
+
+            loss, metrics = _forward_recovery_step(
+                model,
+                batch,
+                t_entry,
+                cfg,
+                backbone=backbone,
+                lm_head=lm_head,
+            )
+            if not _math.isfinite(metrics["loss"]):
+                raise RecoveryError(f"Non-finite recovery loss at step {step}: {metrics['loss']}")
+
+            scaled_loss = loss / float(accum)
+            scaled_loss.backward()
+
+            step += 1
+            batch_cursor = (batch_cursor + 1) % total_batches
+            tokens_consumed += int(metrics["supervised_tokens"])
+            history.append({"step": float(step), **metrics})
+
+            if step % accum == 0 or step >= target_steps:
+                for p in trainable:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        raise RecoveryError(f"Non-finite gradient detected at step {step}")
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if eval_batches and (step % max(1, cfg.eval_every_steps) == 0 or step >= target_steps):
+                ev_loss = _eval_heldout_loss(
+                    model,
+                    eval_batches,
+                    eval_teacher_cache=eval_teacher_cache,
+                    cfg=cfg,
+                )
+                eval_history.append({"step": step, "eval_loss": ev_loss, "tokens": tokens_consumed})
+                if best_path is not None and ev_loss < best_eval_loss:
+                    best_eval_loss = ev_loss
+                    _atomic_torch_save(
+                        {
+                            "step": step,
+                            "batch_cursor": batch_cursor,
+                            "tokens_consumed": tokens_consumed,
+                            "best_eval_loss": best_eval_loss,
+                            "config_fingerprint": fingerprint,
+                            "trainable_state_dict": _extract_trainable_state(model),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "rng_state": torch.get_rng_state(),
+                        },
+                        best_path,
+                    )
+                elif ev_loss < best_eval_loss:
+                    best_eval_loss = ev_loss
+
+            if latest_path is not None and (step % max(1, cfg.checkpoint_every_steps) == 0 or step >= target_steps):
                 _atomic_torch_save(
                     {
                         "step": step,
+                        "batch_cursor": batch_cursor,
                         "tokens_consumed": tokens_consumed,
                         "best_eval_loss": best_eval_loss,
+                        "eval_history": eval_history,
                         "config_fingerprint": fingerprint,
                         "trainable_state_dict": _extract_trainable_state(model),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "rng_state": torch.get_rng_state(),
                     },
-                    best_path,
+                    latest_path,
                 )
-            elif ev_loss < best_eval_loss:
-                best_eval_loss = ev_loss
 
-        if latest_path is not None and (step % max(1, cfg.checkpoint_every_steps) == 0 or step >= target_steps):
-            _atomic_torch_save(
-                {
-                    "step": step,
-                    "tokens_consumed": tokens_consumed,
-                    "best_eval_loss": best_eval_loss,
-                    "eval_history": eval_history,
-                    "config_fingerprint": fingerprint,
-                    "trainable_state_dict": _extract_trainable_state(model),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "rng_state": torch.get_rng_state(),
-                },
-                latest_path,
-            )
+        _verify_frozen_codes_unchanged(model, frozen_snap)
 
-    _verify_frozen_codes_unchanged(model, frozen_snap)
-
-    rollback_applied = False
-    selected_checkpoint = "final"
-    final_eval_loss = eval_history[-1]["eval_loss"] if eval_history else None
-    if (
-        restore_best
-        and best_path is not None
-        and best_path.is_file()
-        and final_eval_loss is not None
-        and best_eval_loss < final_eval_loss
-    ):
-        best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(best_ckpt["trainable_state_dict"], strict=False)
-        rollback_applied = True
-        selected_checkpoint = "best"
+        rollback_applied = False
+        selected_checkpoint = "final"
+        final_eval_loss = eval_history[-1]["eval_loss"] if eval_history else None
+        if (
+            restore_best
+            and best_path is not None
+            and best_path.is_file()
+            and final_eval_loss is not None
+            and best_eval_loss < final_eval_loss
+        ):
+            best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(best_ckpt["trainable_state_dict"], strict=False)
+            rollback_applied = True
+            selected_checkpoint = "best"
+    finally:
+        model.eval()
 
     return {
         "steps_completed": step,
@@ -1423,4 +1976,5 @@ def train_mixed_precision_recovery(
         "rollback_applied": rollback_applied,
         "config_fingerprint": fingerprint,
         "checkpoint_dir": str(ckpt_dir) if ckpt_dir is not None else None,
+        "param_group_lrs": [float(g["lr"]) for g in optimizer.param_groups],
     }

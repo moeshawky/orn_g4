@@ -231,3 +231,34 @@ def test_locate_dataset_hf_snapshot(tmp_path, monkeypatch):
     assert res == fake_hf_dir
 
 
+def test_build_layout_prioritizes_azrael_sft_v2_ahead_of_root_mvp(tmp_path):
+    """V2 manifest under release/azrael-sft-v2/ must take precedence over root legacy MVP."""
+    from orn_g4.data import build_layout
+
+    snap = tmp_path / "hf_snapshot"
+    # Legacy root MVP manifest + shard
+    legacy_dir = snap / "train_ready" / "mvp"
+    legacy_dir.mkdir(parents=True)
+    _make_shard_npz(legacy_dir / "legacy.npz", n_examples=4, in_f=6)
+    (snap / "DATASET_RELEASE_MANIFEST.json").write_text(
+        json.dumps({"shards": [{"path": "train_ready/mvp/legacy.npz", "rows": 4}]}),
+        encoding="utf-8",
+    )
+
+    # V2 manifest + shard
+    v2_root = snap / "release" / "azrael-sft-v2"
+    v2_comb = v2_root / "combined"
+    v2_comb.mkdir(parents=True)
+    _make_shard_npz(v2_comb / "combined_train.npz", n_examples=9, in_f=6)
+    (v2_root / "DATASET_RELEASE_MANIFEST.json").write_text(
+        json.dumps({"shards": [{"path": "combined/combined_train.npz", "rows": 9}]}),
+        encoding="utf-8",
+    )
+
+    layout = build_layout(source=snap)
+    assert layout.dataset_root == v2_root.resolve()
+    assert len(layout.shards) == 1
+    assert layout.shards[0].name == "combined_train.npz"
+    assert layout.shards[0].num_examples == 9
+
+

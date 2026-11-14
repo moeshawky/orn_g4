@@ -341,6 +341,474 @@ def load_processor_and_tokenizer(model_dir: Path | str) -> tuple[object, object]
     return processor, tokenizer
 
 
+def _is_mtp_key(name: str) -> bool:
+    return name == "mtp" or name.startswith(("mtp.", "model.mtp."))
+
+
+def _is_vision_key(name: str) -> bool:
+    return name.startswith(("model.visual.", "visual.", "model.vision_tower.", "vision_tower."))
+
+
+def _load_source_safetensors(source_dir: Path) -> dict[str, Any]:
+    try:
+        from safetensors.torch import load_file as st_load_file
+    except ImportError as exc:
+        raise ModelSourceError(f"safetensors.torch is required to read weights: {exc}") from exc
+
+    index_path = source_dir / "model.safetensors.index.json"
+    single_path = source_dir / "model.safetensors"
+    tensors: dict[str, Any] = {}
+
+    if index_path.is_file():
+        try:
+            index_obj = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ModelSourceError(f"invalid model.safetensors.index.json at {index_path}: {exc}") from exc
+        weight_map = index_obj.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ModelSourceError(f"model.safetensors.index.json has empty weight_map at {index_path}")
+        shard_names = sorted(set(str(v) for v in weight_map.values()))
+        for shard_name in shard_names:
+            shard_path = (source_dir / shard_name).resolve()
+            if not shard_path.is_relative_to(source_dir.resolve()):
+                raise ModelSourceError(f"shard path escapes source_dir: {shard_name!r}")
+            if not shard_path.is_file():
+                raise ModelSourceError(f"missing safetensors shard referenced by index: {shard_path}")
+            shard_tensors = st_load_file(str(shard_path), device="cpu")
+            for k, v in shard_tensors.items():
+                if k in tensors:
+                    raise ModelSourceError(f"duplicate tensor key across shards: {k!r}")
+                tensors[k] = v
+        missing_keys = set(weight_map.keys()) - set(tensors.keys())
+        if missing_keys:
+            raise ModelSourceError(
+                f"shards missing indexed tensors: {sorted(missing_keys)[:5]}"
+            )
+        return tensors
+
+    if single_path.is_file():
+        return st_load_file(str(single_path), device="cpu")
+
+    raise ModelSourceError(
+        f"no model.safetensors or model.safetensors.index.json found in {source_dir}"
+    )
+
+
+def _save_target_safetensors(
+    tensors: dict[str, Any],
+    dest_dir: Path,
+    *,
+    shard_size_mb: int = 2048,
+    metadata: dict[str, str] | None = None,
+) -> list[str]:
+    import os
+
+    import torch
+    from safetensors.torch import save_file as st_save_file
+
+    max_bytes = max(1, int(shard_size_mb)) * 1024 * 1024
+    seen_ptrs: set[tuple[int, int, tuple[int, ...]]] = set()
+    prepared: list[tuple[str, torch.Tensor, int]] = []
+    for name in sorted(tensors.keys()):
+        t = tensors[name].detach().cpu().contiguous()
+        sig = (t.data_ptr(), t.numel() * t.element_size(), tuple(t.shape))
+        if sig in seen_ptrs:
+            t = t.clone()
+        else:
+            seen_ptrs.add(sig)
+        nbytes = int(t.numel()) * int(t.element_size())
+        prepared.append((name, t, nbytes))
+
+    if not prepared:
+        return []
+
+    shards: list[list[tuple[str, torch.Tensor]]] = [[]]
+    cur_bytes = 0
+    for name, t, nbytes in prepared:
+        if shards[-1] and cur_bytes + nbytes > max_bytes:
+            shards.append([(name, t)])
+            cur_bytes = nbytes
+        else:
+            shards[-1].append((name, t))
+            cur_bytes += nbytes
+
+    str_meta = {str(k): str(v) for k, v in metadata.items()} if metadata else None
+
+    if len(shards) == 1:
+        shard_name = "model.safetensors"
+        out_path = dest_dir / shard_name
+        tmp_path = dest_dir / (shard_name + ".tmp")
+        st_save_file({n: t for n, t in shards[0]}, str(tmp_path), metadata=str_meta)
+        os.replace(tmp_path, out_path)
+        return [shard_name]
+
+    total = len(shards)
+    weight_map: dict[str, str] = {}
+    shard_files: list[str] = []
+    total_size = sum(nb for _, _, nb in prepared)
+    for idx, items in enumerate(shards, start=1):
+        shard_name = f"model-{idx:05d}-of-{total:05d}.safetensors"
+        out_path = dest_dir / shard_name
+        tmp_path = dest_dir / (shard_name + ".tmp")
+        st_save_file({n: t for n, t in items}, str(tmp_path), metadata=str_meta)
+        os.replace(tmp_path, out_path)
+        shard_files.append(shard_name)
+        for n, _ in items:
+            weight_map[n] = shard_name
+
+    index_obj = {
+        "metadata": {"total_size": total_size},
+        "weight_map": weight_map,
+    }
+    index_tmp = dest_dir / "model.safetensors.index.json.tmp"
+    index_tmp.write_text(
+        json.dumps(index_obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(index_tmp, dest_dir / "model.safetensors.index.json")
+    return shard_files
+
+
+def _build_causal_text_config(src_config: dict[str, Any]) -> dict[str, Any]:
+    import copy
+
+    raw_text = src_config.get("text_config")
+    if isinstance(raw_text, dict):
+        cfg = copy.deepcopy(raw_text)
+    else:
+        cfg = copy.deepcopy(src_config)
+
+    for vision_key in (
+        "vision_config",
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    ):
+        cfg.pop(vision_key, None)
+
+    src_model_type = str(src_config.get("model_type", ""))
+    cfg_model_type = str(cfg.get("model_type", src_model_type or "qwen3_5_text"))
+    if src_model_type == "qwen3_5" or cfg_model_type == "qwen3_5":
+        cfg["model_type"] = "qwen3_5_text"
+    else:
+        cfg["model_type"] = cfg_model_type
+
+    archs = cfg.get("architectures") or src_config.get("architectures") or []
+    if cfg["model_type"] == "qwen3_5_text":
+        cfg["architectures"] = ["Qwen3_5ForCausalLM"]
+    elif archs:
+        cfg["architectures"] = [
+            a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
+        ]
+
+    for shared_key in (
+        "tie_word_embeddings",
+        "dtype",
+        "torch_dtype",
+        "eos_token_id",
+        "bos_token_id",
+        "pad_token_id",
+        "transformers_version",
+    ):
+        if shared_key not in cfg and shared_key in src_config:
+            cfg[shared_key] = copy.deepcopy(src_config[shared_key])
+    return cfg
+
+
+def extract_text_causal_lm_checkpoint(
+    source_dir: Path | str,
+    output_dir: Path | str | None = None,
+    *,
+    text_output_dir: Path | str | None = None,
+    vision_output_dir: Path | str | None = None,
+    shard_size_mb: int = 2048,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Extract a standalone causal text BF16 checkpoint from multimodal Ornith.
+
+    Remaps ``model.language_model.* -> model.*``, keeps ``lm_head.*``, separates
+    ``model.visual.*`` into ``vision_sidecar/``, excludes ``mtp.*`` keys, and
+    promotes ``text_config`` to top-level ``config.json`` compatible with
+    ``AutoModelForCausalLM``.
+
+    # Errors: raises :class:`ModelSourceError` when weights/config are missing,
+    keys cannot be routed cleanly, or destination exists without ``overwrite=True``.
+    """
+    import copy
+    import os
+    import shutil
+
+    src = Path(source_dir).resolve()
+    if not src.is_dir():
+        raise ModelSourceError(f"source_dir does not exist: {src}")
+    src_config = load_config(src)
+    is_multimodal = isinstance(src_config.get("text_config"), dict) or (
+        "vision_config" in src_config
+    ) or str(src_config.get("model_type", "")) == "qwen3_5"
+
+    if output_dir is not None:
+        base = Path(output_dir).resolve()
+        text_dir = (
+            Path(text_output_dir).resolve()
+            if text_output_dir is not None
+            else (base / "teacher_text_bf16")
+        )
+        vision_dir = (
+            Path(vision_output_dir).resolve()
+            if vision_output_dir is not None
+            else (base / "vision_sidecar")
+        )
+    elif text_output_dir is not None:
+        text_dir = Path(text_output_dir).resolve()
+        vision_dir = (
+            Path(vision_output_dir).resolve()
+            if vision_output_dir is not None
+            else (text_dir.parent / "vision_sidecar")
+        )
+    else:
+        raise ModelSourceError(
+            "extract_text_causal_lm_checkpoint requires output_dir or text_output_dir"
+        )
+
+    for target in (text_dir, vision_dir):
+        if target.exists() and any(target.iterdir()) and not overwrite:
+            raise ModelSourceError(
+                f"destination directory already exists and overwrite=False: {target}"
+            )
+
+    all_tensors = _load_source_safetensors(src)
+    if not all_tensors:
+        raise ModelSourceError(f"source checkpoint has no tensors: {src}")
+
+    text_tensors: dict[str, Any] = {}
+    vision_tensors: dict[str, Any] = {}
+    excluded_mtp_keys: list[str] = []
+    remapped_prefix_count = 0
+
+    for name in sorted(all_tensors.keys()):
+        tensor = all_tensors[name]
+        if _is_mtp_key(name):
+            excluded_mtp_keys.append(name)
+            continue
+        if _is_vision_key(name):
+            vision_tensors[name] = tensor
+            continue
+        if name.startswith("model.language_model."):
+            suffix = name[len("model.language_model.") :]
+            if suffix.startswith("lm_head."):
+                new_name = suffix
+            else:
+                new_name = f"model.{suffix}"
+            remapped_prefix_count += 1
+        elif name.startswith("language_model."):
+            suffix = name[len("language_model.") :]
+            new_name = suffix if suffix.startswith("lm_head.") else f"model.{suffix}"
+            remapped_prefix_count += 1
+        elif name.startswith("lm_head."):
+            new_name = name
+        elif name.startswith("model.lm_head."):
+            new_name = name[len("model.") :]
+        elif not is_multimodal and name.startswith("model."):
+            new_name = name
+        else:
+            raise ModelSourceError(
+                f"unclassified checkpoint tensor key in multimodal extraction: {name!r}"
+            )
+
+        if new_name in text_tensors:
+            raise ModelSourceError(f"key collision after prefix remap: {new_name!r}")
+        text_tensors[new_name] = tensor
+
+    if not text_tensors:
+        raise ModelSourceError(f"no text tensors extracted from {src}")
+
+    text_cfg = _build_causal_text_config(src_config)
+    vision_cfg = {
+        k: copy.deepcopy(src_config[k])
+        for k in (
+            "model_type",
+            "architectures",
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+        )
+        if k in src_config
+    }
+
+    text_dir.parent.mkdir(parents=True, exist_ok=True)
+    vision_dir.parent.mkdir(parents=True, exist_ok=True)
+    text_tmp = text_dir.with_name(text_dir.name + ".incomplete")
+    vision_tmp = vision_dir.with_name(vision_dir.name + ".incomplete")
+    for tmp in (text_tmp, vision_tmp):
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+
+    vision_only_files = {
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "image_processor_config.json",
+    }
+    ignored_files = {
+        "config.json",
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+    }
+    ignored_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".onnx")
+
+    copied_assets: list[str] = []
+    vision_assets: list[str] = []
+
+    try:
+        (text_tmp / "config.json").write_text(
+            json.dumps(text_cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        text_shards = _save_target_safetensors(
+            text_tensors,
+            text_tmp,
+            shard_size_mb=shard_size_mb,
+            metadata={"format": "pt", "extracted_from": str(src.name)},
+        )
+
+        vision_shards: list[str] = []
+        if vision_tensors:
+            vision_shards = _save_target_safetensors(
+                vision_tensors,
+                vision_tmp,
+                shard_size_mb=shard_size_mb,
+                metadata={"format": "pt", "sidecar_from": str(src.name)},
+            )
+        if vision_cfg:
+            (vision_tmp / "config.json").write_text(
+                json.dumps(vision_cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+        for entry in sorted(src.iterdir()):
+            if not entry.is_file():
+                continue
+            fname = entry.name
+            if fname in ignored_files or fname.endswith(ignored_suffixes):
+                continue
+            if fname in vision_only_files:
+                shutil.copy2(str(entry), str(vision_tmp / fname))
+                vision_assets.append(fname)
+            else:
+                shutil.copy2(str(entry), str(text_tmp / fname))
+                copied_assets.append(fname)
+
+        summary = {
+            "source_dir": str(src),
+            "text_dir": str(text_dir),
+            "vision_dir": str(vision_dir),
+            "source_tensor_count": len(all_tensors),
+            "text_tensor_count": len(text_tensors),
+            "vision_tensor_count": len(vision_tensors),
+            "excluded_mtp_count": len(excluded_mtp_keys),
+            "remapped_prefix_count": remapped_prefix_count,
+            "excluded_mtp_keys": excluded_mtp_keys,
+            "text_keys": sorted(text_tensors.keys()),
+            "vision_keys": sorted(vision_tensors.keys()),
+            "text_model_type": text_cfg.get("model_type"),
+            "text_architectures": list(text_cfg.get("architectures", [])),
+            "tie_word_embeddings": text_cfg.get("tie_word_embeddings"),
+            "text_shards": text_shards,
+            "vision_shards": vision_shards,
+            "copied_assets": copied_assets,
+            "vision_assets": vision_assets,
+        }
+        (vision_tmp / "vision_sidecar_manifest.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        if text_dir.exists() and overwrite:
+            shutil.rmtree(text_dir)
+        os.replace(text_tmp, text_dir)
+
+        if vision_dir.exists() and overwrite:
+            shutil.rmtree(vision_dir)
+        os.replace(vision_tmp, vision_dir)
+        return summary
+    except Exception:
+        for tmp in (text_tmp, vision_tmp):
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def load_text_causal_model(
+    model_dir: Path | str,
+    device: str = "cuda:0",
+    dtype: object = None,
+    low_cpu_mem_usage: bool = True,
+    *,
+    torch_dtype: object = None,
+    trust_remote_code: bool = False,
+) -> object:
+    """Load an extracted standalone text-only causal LM (``AutoModelForCausalLM``).
+
+    Rejects unextracted multimodal checkpoints rather than silently misloading.
+
+    # Errors: raises :class:`ModelSourceError` when the checkpoint is multimodal,
+    missing ``config.json``, or transformers fails to load it.
+    """
+    try:
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+    except ImportError as exc:
+        raise ModelSourceError(
+            f"torch and transformers are required for causal model loading: {exc}"
+        ) from exc
+
+    resolved_dir = Path(model_dir).resolve()
+    raw_cfg = load_config(resolved_dir)
+    if (
+        "vision_config" in raw_cfg
+        or str(raw_cfg.get("model_type", "")) == "qwen3_5"
+        or "Qwen3_5ForConditionalGeneration" in list(raw_cfg.get("architectures") or [])
+    ):
+        raise ModelSourceError(
+            f"{resolved_dir} is a multimodal checkpoint; run extract_text_causal_lm_checkpoint() first"
+        )
+
+    effective_dtype = dtype if dtype is not None else torch_dtype
+    if effective_dtype is None:
+        effective_dtype = torch.bfloat16
+    elif isinstance(effective_dtype, str):
+        effective_dtype = getattr(torch, effective_dtype)
+
+    try:
+        cfg = AutoConfig.from_pretrained(str(resolved_dir), trust_remote_code=trust_remote_code)
+        kwargs: dict[str, Any] = {
+            "low_cpu_mem_usage": low_cpu_mem_usage,
+            "trust_remote_code": trust_remote_code,
+        }
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                str(resolved_dir), config=cfg, dtype=effective_dtype, **kwargs
+            )
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(
+                str(resolved_dir), config=cfg, torch_dtype=effective_dtype, **kwargs
+            )
+        if device is not None and str(device) != "cpu":
+            model = model.to(device)
+        if not any(b.is_meta for b in model.buffers()):
+            from .loader import restore_qwen3_5_nonpersistent_buffers
+
+            restore_qwen3_5_nonpersistent_buffers(model)
+        return model
+    except Exception as exc:
+        raise ModelSourceError(
+            f"failed to load causal text model from {resolved_dir}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 __all__ = [
     "DEFAULT_MODEL_HANDLE",
     "HF_MODEL_HANDLE",
@@ -349,6 +817,8 @@ __all__ = [
     "load_config",
     "load_foundation_model",
     "load_processor_and_tokenizer",
+    "extract_text_causal_lm_checkpoint",
+    "load_text_causal_model",
     "discover_architecture",
     "freeze_targets",
     "count_trainable",

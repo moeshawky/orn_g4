@@ -80,6 +80,7 @@ class QTEAConfig:
     rescale_iters: int = 2  # Column-wise rescale refinement rounds (0 disables)
     decay: float = 1.0  # Lambda parameter for GPTQ error decay (0 disables)
     damp: float = 0.007  # Hessian damping fraction of mean diagonal
+    hessian_norm: str = "sequences"  # "sequences" (upstream bit-compat) or "tokens"
 
 
 def ternary_assign(centered: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -160,6 +161,24 @@ class QTEA:
         self.rows, self.columns = layer.weight.shape
         self.hessian = torch.zeros((self.columns, self.columns), device=self.device)
         self.nsamples = 0
+        self.valid_tokens = 0
+        self.total_tokens = 0
+        self.masked_tokens_dropped = 0
+        self._last_cholesky_diagnostics: Dict[str, Any] = {
+            "damping_escalations": 0,
+            "cholesky_fallback": False,
+        }
+        self.conditioning: Dict[str, Any] = {
+            "valid_tokens": 0,
+            "total_tokens": 0,
+            "masked_tokens_dropped": 0,
+            "nsamples": 0,
+            "zero_count": 0,
+            "diag_min": 0.0,
+            "diag_max": 0.0,
+            "damping_escalations": 0,
+            "cholesky_fallback": False,
+        }
 
         if self.columns % self.config.group_size != 0:
             raise ValueError(
@@ -171,13 +190,66 @@ class QTEA:
             )
 
     @_torch_no_grad
-    def add_batch(self, inp: torch.Tensor) -> None:
-        """Fold one calibration batch into the running Hessian H = 2/N * sum X X^T."""
-        sequences = inp.shape[0] if inp.dim() == 3 else 1
-        inp_flat = inp.reshape(-1, inp.shape[-1]).t()
-        self.hessian *= self.nsamples / (self.nsamples + sequences)
+    def add_batch(
+        self,
+        inp: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Fold one calibration batch into the running Hessian H = 2/N * sum X X^T.
+
+        When ``attention_mask`` is supplied, padded / invalid token positions are
+        excluded before accumulating ``X^T X``.
+
+        # Errors: raises QTEAError if ``attention_mask`` length mismatches ``inp``
+        tokens or ``config.hessian_norm`` is invalid.
+        """
+        norm_mode = getattr(self.config, "hessian_norm", "sequences")
+        if norm_mode not in {"sequences", "tokens"}:
+            raise QTEAError(
+                f"Unsupported hessian_norm={norm_mode!r}; expected 'sequences' or 'tokens'"
+            )
+        flat = inp.reshape(-1, inp.shape[-1])
+        total_in_batch = int(flat.shape[0])
+        self.total_tokens += total_in_batch
+
+        if attention_mask is not None:
+            mask_flat = attention_mask.reshape(-1).to(device=inp.device)
+            if int(mask_flat.numel()) != total_in_batch:
+                raise QTEAError(
+                    f"attention_mask length {mask_flat.numel()} != input token count {total_in_batch}"
+                )
+            valid_mask = mask_flat.bool()
+            valid_in_batch = int(valid_mask.sum().item())
+            self.masked_tokens_dropped += total_in_batch - valid_in_batch
+            if valid_in_batch == 0:
+                return
+            flat = flat[valid_mask]
+            if inp.dim() == 3:
+                seq_has_valid = int(
+                    attention_mask.reshape(inp.shape[0], -1).bool().any(dim=1).sum().item()
+                )
+                sequences = max(1, seq_has_valid)
+            else:
+                sequences = 1
+        else:
+            valid_in_batch = total_in_batch
+            sequences = inp.shape[0] if inp.dim() == 3 else 1
+
+        prev_valid = self.valid_tokens
+        prev_seq = self.nsamples
+        self.valid_tokens += valid_in_batch
         self.nsamples += sequences
-        scaled = math.sqrt(2.0 / self.nsamples) * inp_flat.float()
+        prev_n, new_n = (
+            (prev_valid, self.valid_tokens)
+            if norm_mode == "tokens"
+            else (prev_seq, self.nsamples)
+        )
+        inp_flat = flat.t()
+        if prev_n == 0:
+            self.hessian.zero_()
+        else:
+            self.hessian *= float(prev_n) / float(new_n)
+        scaled = math.sqrt(2.0 / float(new_n)) * inp_flat.float()
         self.hessian += scaled.matmul(scaled.t())
 
     def free(self) -> None:
@@ -237,13 +309,23 @@ class QTEA:
         """Upper-triangular Cholesky factor of H^-1, retrying with increased damping."""
         diag = torch.arange(self.columns, device=H.device)
         H[diag, diag] += self.config.damp * torch.diag(H).mean()
+        escalations = 0
         for _ in range(5):
             try:
                 inverse = torch.cholesky_inverse(torch.linalg.cholesky(H))
+                self._last_cholesky_diagnostics = {
+                    "damping_escalations": escalations,
+                    "cholesky_fallback": False,
+                }
                 return torch.linalg.cholesky(inverse, upper=True)
             except torch.linalg.LinAlgError:
+                escalations += 1
                 H[diag, diag] += 0.01 * torch.diag(H).mean()
         # Fallback to inverse square-root of diagonal
+        self._last_cholesky_diagnostics = {
+            "damping_escalations": escalations,
+            "cholesky_fallback": True,
+        }
         return torch.diag(1.0 / torch.diag(H).clamp_min(1e-8).sqrt())
 
     def _rescale_refine(
@@ -336,7 +418,12 @@ class QTEA:
         )
         self.hessian = None
 
-        dead = torch.diag(H) == 0
+        diag_vals = torch.diag(H).detach().float()
+        zero_count = int((diag_vals == 0).sum().item())
+        diag_min = float(diag_vals.min().item()) if diag_vals.numel() else 0.0
+        diag_max = float(diag_vals.max().item()) if diag_vals.numel() else 0.0
+
+        dead = diag_vals == 0
         H[dead, dead] = 1.0
         W[:, dead] = 0.0
 
@@ -416,6 +503,18 @@ class QTEA:
             # dequantized reconstruction.
             self.layer.weight.data = dequantized.to(self.layer.weight.dtype)
 
+        self.conditioning = {
+            "valid_tokens": int(self.valid_tokens),
+            "total_tokens": int(self.total_tokens),
+            "masked_tokens_dropped": int(self.masked_tokens_dropped),
+            "nsamples": int(self.nsamples),
+            "zero_count": zero_count,
+            "diag_min": diag_min,
+            "diag_max": diag_max,
+            "damping_escalations": int(self._last_cholesky_diagnostics["damping_escalations"]),
+            "cholesky_fallback": bool(self._last_cholesky_diagnostics["cholesky_fallback"]),
+        }
+
         payload = self._payload(
             groups,
             codes_all,
@@ -426,6 +525,7 @@ class QTEA:
             residual_scales,
         )
         payload["dequantized_weight"] = dequantized
+        payload["conditioning"] = dict(self.conditioning)
         return payload
 
     def _payload(
@@ -759,16 +859,24 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
         train_scales: bool = True,
         lora_rank: int = 0,
         lora_alpha: float = 32.0,
+        adapter_dtype: Optional[Any] = None,
     ) -> None:
         """Promote continuous QTEA parameters for differentiable recovery.
 
         Keeps discrete ``ternary``, ``salient_cols``, ``residual_index``,
         ``residual_value``, and ``residual_scale`` frozen as buffers.
 
-        # Errors: raises QTEAError if ``lora_rank < 0``.
+        # Errors: raises QTEAError if ``lora_rank < 0`` or ``adapter_dtype``
+        is not ``torch.float32`` (BF16 optimizer states stall updates).
         """
         if lora_rank < 0:
             raise QTEAError(f"lora_rank must be non-negative, got {lora_rank}")
+        resolved_dtype = torch.float32 if adapter_dtype is None else adapter_dtype
+        if resolved_dtype != torch.float32:
+            raise QTEAError(
+                f"Trainable recovery parameters require torch.float32, got {resolved_dtype!r}; "
+                "use BF16 only at export serialization"
+            )
         dev = self.ternary.device
         if train_scales:
             for pname in ("group_alpha", "group_beta", "col_v"):
@@ -777,21 +885,25 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
                     self.register_parameter(
                         pname,
                         nn.Parameter(
-                            buf.detach().clone().to(device=dev, dtype=torch.float32),
+                            buf.detach().clone().to(device=dev, dtype=resolved_dtype),
                             requires_grad=True,
                         ),
                     )
                 elif pname in self._parameters and self._parameters[pname] is not None:
+                    if self._parameters[pname].dtype != resolved_dtype:
+                        self._parameters[pname].data = self._parameters[pname].data.to(
+                            dtype=resolved_dtype
+                        )
                     self._parameters[pname].requires_grad_(True)
         if lora_rank > 0:
             self.lora_rank = int(lora_rank)
             self.lora_alpha = float(lora_alpha)
             lora_a = torch.empty(
-                self.lora_rank, self.in_features, dtype=torch.float32, device=dev
+                self.lora_rank, self.in_features, dtype=resolved_dtype, device=dev
             )
             nn.init.kaiming_uniform_(lora_a, a=math.sqrt(5))
             lora_b = torch.zeros(
-                self.out_features, self.lora_rank, dtype=torch.float32, device=dev
+                self.out_features, self.lora_rank, dtype=resolved_dtype, device=dev
             )
             self.lora_A = nn.Parameter(lora_a, requires_grad=True)
             self.lora_B = nn.Parameter(lora_b, requires_grad=True)
@@ -818,9 +930,9 @@ class QTEALinear(nn.Module if _TORCH_AVAILABLE else object):  # type: ignore[mis
             src_b = state_dict[prefix + "lora_B"]
             dev = self.ternary.device
             if self.lora_A is None or tuple(self.lora_A.shape) != tuple(src_a.shape):
-                self.lora_A = nn.Parameter(torch.empty_like(src_a, device=dev), requires_grad=False)
+                self.lora_A = nn.Parameter(torch.empty(src_a.shape, dtype=torch.float32, device=dev), requires_grad=False)
             if self.lora_B is None or tuple(self.lora_B.shape) != tuple(src_b.shape):
-                self.lora_B = nn.Parameter(torch.empty_like(src_b, device=dev), requires_grad=False)
+                self.lora_B = nn.Parameter(torch.empty(src_b.shape, dtype=torch.float32, device=dev), requires_grad=False)
             self.lora_rank = int(src_a.shape[0])
             if self.lora_alpha == 0.0:
                 self.lora_alpha = float(self.lora_rank * 2)
@@ -931,8 +1043,9 @@ ORNITH_TARGET_FAMILIES = {
     "mlp": ("gate_proj", "up_proj", "down_proj"),
 }
 
-#: Authoritative mixed-precision projection registry for Ornith-1.5-9B:
-#: 24 linear_attn + 8 self_attn + 32 mlp = 144 QTEA + 104 4-bit = 248 total.
+#: Authoritative mixed-precision projection registry for Ornith-1.5-9B (ADV-12.1, ticket 007):
+#: 24 linear_attn + 8 self_attn + 32 mlp layers -> 248 projections =
+#: 112 QTEA + 88 INT4 (``act_sym_int4_g128``) + 48 BF16 (kept unconverted).
 PROJECTION_PRECISION_POLICY: Dict[Tuple[str, str], str] = {
     ("mlp", "gate_proj"): "qtea",
     ("mlp", "up_proj"): "qtea",
@@ -940,13 +1053,19 @@ PROJECTION_PRECISION_POLICY: Dict[Tuple[str, str], str] = {
     ("self_attn", "q_proj"): "qtea",
     ("self_attn", "k_proj"): "qtea",
     ("self_attn", "v_proj"): "qtea",
-    ("self_attn", "o_proj"): "qtea",
+    ("self_attn", "o_proj"): "int4",
     ("linear_attn", "in_proj_qkv"): "qtea",
-    ("linear_attn", "out_proj"): "qtea",
-    ("linear_attn", "in_proj_a"): "int4",
-    ("linear_attn", "in_proj_b"): "int4",
+    ("linear_attn", "out_proj"): "int4",
     ("linear_attn", "in_proj_z"): "int4",
+    ("linear_attn", "in_proj_a"): "bf16",
+    ("linear_attn", "in_proj_b"): "bf16",
 }
+
+#: Frozen registry counts (ticket 007 section 3: do not change).
+EXPECTED_QTEA_COUNT = 112
+EXPECTED_INT4_COUNT = 88
+EXPECTED_BF16_COUNT = 48
+EXPECTED_PROJECTION_COUNT = 248
 
 _EXCLUDED_MODULE_PREFIXES = (
     "visual",
@@ -968,7 +1087,7 @@ class ProjectionTarget:
     layer_index: int
     family: str
     leaf: str
-    precision: str  # "qtea" | "int4"
+    precision: str  # "qtea" | "int4" | "bf16"
     in_features: int
     out_features: int
     has_bias: bool
@@ -982,6 +1101,7 @@ class MixedPrecisionPlan:
     targets: Tuple[ProjectionTarget, ...]
     qtea_targets: Tuple[ProjectionTarget, ...]
     int4_targets: Tuple[ProjectionTarget, ...]
+    bf16_targets: Tuple[ProjectionTarget, ...]
     excluded_modules: Tuple[str, ...]
     layer_count: int
     linear_attn_layers: int
@@ -1007,10 +1127,11 @@ def _resolve_layers_root(model: Any) -> Tuple[str, Any]:
 def discover_mixed_precision_targets(
     model: Any,
     *,
-    expected_qtea: int = 144,
-    expected_int4: int = 104,
-    expected_total: int = 248,
+    expected_qtea: int = EXPECTED_QTEA_COUNT,
+    expected_int4: int = EXPECTED_INT4_COUNT,
+    expected_total: int = EXPECTED_PROJECTION_COUNT,
     strict: bool = True,
+    expected_bf16: Optional[int] = None,
 ) -> MixedPrecisionPlan:
     """Discover and validate mixed-precision projection targets for Ornith-1.5-9B.
 
@@ -1096,13 +1217,22 @@ def discover_mixed_precision_targets(
 
     qtea_targets = tuple(t for t in targets if t.precision == "qtea")
     int4_targets = tuple(t for t in targets if t.precision == "int4")
+    bf16_targets = tuple(t for t in targets if t.precision == "bf16")
+    if expected_bf16 is None:
+        expected_bf16 = expected_total - expected_qtea - expected_int4
 
     if strict:
-        if len(qtea_targets) != expected_qtea or len(int4_targets) != expected_int4 or len(targets) != expected_total:
+        if (
+            len(qtea_targets) != expected_qtea
+            or len(int4_targets) != expected_int4
+            or len(bf16_targets) != expected_bf16
+            or len(targets) != expected_total
+        ):
             raise QTEAError(
                 f"Mixed-precision projection count mismatch: "
                 f"qtea={len(qtea_targets)} (expected {expected_qtea}), "
                 f"int4={len(int4_targets)} (expected {expected_int4}), "
+                f"bf16={len(bf16_targets)} (expected {expected_bf16}), "
                 f"total={len(targets)} (expected {expected_total})"
             )
 
@@ -1111,6 +1241,7 @@ def discover_mixed_precision_targets(
         targets=tuple(targets),
         qtea_targets=qtea_targets,
         int4_targets=int4_targets,
+        bf16_targets=bf16_targets,
         excluded_modules=tuple(excluded),
         layer_count=len(layers),
         linear_attn_layers=linear_attn_layers,
@@ -1119,6 +1250,47 @@ def discover_mixed_precision_targets(
         assignments=assignments,
         prefix=prefix,
     )
+
+
+def _unpack_calibration_batch(batch: Any) -> Tuple[Any, Optional[Any]]:
+    """Extract (activations, optional attention_mask) from tensor, tuple, or mapping."""
+    if isinstance(batch, dict):
+        for key in ("inputs", "input", "hidden_states", "x"):
+            if key in batch:
+                return batch[key], batch.get("attention_mask")
+        raise QTEAError(f"Calibration batch dict missing activation tensor: {sorted(batch)}")
+    if isinstance(batch, (tuple, list)) and len(batch) == 2:
+        return batch[0], batch[1]
+    return batch, None
+
+
+def _accumulate_calibration_hessian(
+    calibration_batches: List[Any],
+    in_features: int,
+    device: Any,
+    *,
+    norm_mode: str = "sequences",
+) -> Tuple[Optional[torch.Tensor], Dict[str, int]]:
+    """Compute masked running Hessian H = 2/N * sum X^T X for INT4/QTEA calibration."""
+    if not calibration_batches:
+        return None, {"valid_tokens": 0, "total_tokens": 0, "masked_tokens_dropped": 0, "nsamples": 0}
+    tmp_linear = nn.Linear(in_features, 1, bias=False, device=device)
+    acc = QTEA(tmp_linear, QTEAConfig(group_size=min(1, in_features) if in_features else 1, residual_group=1, hessian_norm=norm_mode))
+    # Skip group_size divisibility for standalone Hessian capture: accumulate with 1x1 dummy replaced by direct size
+    acc.columns = in_features
+    acc.hessian = torch.zeros((in_features, in_features), device=device)
+    for item in calibration_batches:
+        inp, mask = _unpack_calibration_batch(item)
+        acc.add_batch(inp, attention_mask=mask)
+    stats = {
+        "valid_tokens": int(acc.valid_tokens),
+        "total_tokens": int(acc.total_tokens),
+        "masked_tokens_dropped": int(acc.masked_tokens_dropped),
+        "nsamples": int(acc.nsamples),
+    }
+    if acc.valid_tokens == 0:
+        return None, stats
+    return acc.hessian, stats
 
 
 def _set_submodule_by_name(root: Any, dotted_name: str, new_module: Any) -> None:
@@ -1136,9 +1308,9 @@ def convert_model_mixed_precision(
     qtea_config: Optional[QTEAConfig] = None,
     int4_group_size: int = 128,
     plan: Optional[MixedPrecisionPlan] = None,
-    expected_qtea: int = 144,
-    expected_int4: int = 104,
-    expected_total: int = 248,
+    expected_qtea: int = EXPECTED_QTEA_COUNT,
+    expected_int4: int = EXPECTED_INT4_COUNT,
+    expected_total: int = EXPECTED_PROJECTION_COUNT,
     strict: bool = True,
     inplace: bool = False,
 ) -> Tuple[Any, Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], MixedPrecisionPlan]:
@@ -1170,6 +1342,16 @@ def convert_model_mixed_precision(
     int4_packed: Dict[str, Dict[str, Any]] = {}
     batches_map = calibration_batches_by_name or {}
 
+    def _resolve_proj_batches(name: str) -> Optional[List[Any]]:
+        if name in batches_map:
+            return batches_map[name]
+        for pfx in ("language_model.", "model."):
+            if name.startswith(pfx):
+                stripped = name[len(pfx):]
+                if stripped in batches_map:
+                    return batches_map[stripped]
+        return None
+
     for target in resolved_plan.targets:
         # Resolve module on work_model (in case inplace=False deepcopied it)
         parent = work_model
@@ -1182,7 +1364,7 @@ def convert_model_mixed_precision(
             )
 
         if target.precision == "qtea":
-            proj_batches = batches_map.get(target.name)
+            proj_batches = _resolve_proj_batches(target.name)
             if not proj_batches:
                 # Deterministic identity activation sample when no activation cache is supplied
                 proj_batches = [
@@ -1198,9 +1380,25 @@ def convert_model_mixed_precision(
             qtea_packed[target.name] = packed
             _set_submodule_by_name(work_model, target.name, q_mod)
         elif target.precision == "int4":
-            q4_mod = Protected4BitLinear.from_linear(src_mod, group_size=int4_group_size)
+            proj_batches = _resolve_proj_batches(target.name)
+            proj_hessian: Optional[torch.Tensor] = None
+            h_stats: Dict[str, Any] = {}
+            if proj_batches:
+                proj_hessian, h_stats = _accumulate_calibration_hessian(
+                    proj_batches,
+                    src_mod.in_features,
+                    src_mod.weight.device,
+                    norm_mode=getattr(cfg, "hessian_norm", "sequences"),
+                )
+            q4_mod = Protected4BitLinear.from_linear(
+                src_mod, group_size=int4_group_size, hessian=proj_hessian
+            )
+            if h_stats:
+                q4_mod.conditioning = dict(h_stats)
             int4_packed[target.name] = q4_mod.to_layer_dict()
             _set_submodule_by_name(work_model, target.name, q4_mod)
+        elif target.precision == "bf16":
+            continue  # kept as the unconverted BF16 nn.Linear
         else:
             raise QTEAError(f"Unsupported precision assignment {target.precision!r} for {target.name!r}")
 
@@ -1284,10 +1482,12 @@ def calibrate_and_quantize_projection(
     cfg = config or QTEAConfig()
     quantizer = QTEA(module, cfg)
     for batch in calibration_batches:
-        quantizer.add_batch(batch)
+        inp, mask = _unpack_calibration_batch(batch)
+        quantizer.add_batch(inp, attention_mask=mask)
     payload = quantizer.quantize(mutate_source=mutate_source)
     packed = pack_layer(payload)
     qtea_mod = QTEALinear.from_payload(
         packed, bias=module.bias.data if module.bias is not None else None
     )
+    qtea_mod.conditioning = dict(quantizer.conditioning)
     return packed, qtea_mod
